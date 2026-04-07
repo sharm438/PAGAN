@@ -84,8 +84,7 @@ def parse_args():
     parser.add_argument("--eval_time",      type=int,   default=10)
     parser.add_argument("--gpu",            type=int,   default=0)
     parser.add_argument("--k",              type=int,   default=20)
-    parser.add_argument("--k_soft",         type=int,   default=9)
-    parser.add_argument("--k_rand",         type=int,   default=9)
+
     parser.add_argument("--lr",             type=float, default=0.1)
     parser.add_argument("--sample_type",    type=str,   default="round_robin",
                         choices=["round_robin","random"])
@@ -96,21 +95,16 @@ def parse_args():
     parser.add_argument("--eval_local",     action="store_true")
     parser.add_argument("--num_workers",    type=int,   default=10)
     parser.add_argument("--embed_dim",      type=int,   default=8)
-    parser.add_argument("--affinity_temp",  type=float, default=0.05)
-    parser.add_argument("--eps",            type=float, default=0.05)
-    parser.add_argument("--eps_mode",       type=str,   default='constant',
-                        choices=['constant','decay'])
-    parser.add_argument("--agg_mode",       type=str,   default='uniform',
-                        choices=['uniform','inv_rank','softmax','harmonic'])
+
     parser.add_argument("--val_frac",       type=float, default=0.0)
 
     # ── PAGANv2-specific args ──────────────────────────────────────────
-    parser.add_argument("--v2_warmup_rounds",   type=int,   default=20)
+    parser.add_argument("--v2_warmup_rounds",   type=int,   default=25)
     parser.add_argument("--v2_ema_lambda",      type=float, default=0.95,
                         help="EMA decay for distance history (0.9=fast, 0.99=slow).")
     parser.add_argument("--v2_tau_0",           type=float, default=2.0,
                         help="Starting aggregation temperature post-warmup.")
-    parser.add_argument("--v2_tau_min",         type=float, default=0.2,
+    parser.add_argument("--v2_tau_min",         type=float, default=0.5,
                         help="Minimum aggregation temperature.")
     parser.add_argument("--v2_tau_half_life",   type=float, default=200.0,
                         help="Rounds post-warmup for tau to reach midpoint.")
@@ -316,6 +310,7 @@ def main(args):
         # v2-specific
         'v2_soft_metrics': [],
         'v2_spearman': [],
+        'v2_emb_stats': [],
     }
     if args.local_test_frac > 0:
         metrics['local_split_stats'] = split_distribution_stats
@@ -462,13 +457,13 @@ def main(args):
                     pagan_v2_protocol.record(rnd, ranked_neighbors, ranked_dists)
 
                     # 4. Rank-0 diagnostic
-                    r0_tp = sum(
-                        1 for idx in range(args.num_spokes)
-                        if ranked_neighbors[idx].numel() > 0 and
-                        node_to_cluster[ranked_neighbors[idx][0].item()] ==
-                        node_to_cluster[idx])
-                    print(f"Round {rnd:3d} [v2]"
-                          f"  R0-TP={r0_tp}/{args.num_spokes}")
+                    # r0_tp = sum(
+                    #     1 for idx in range(args.num_spokes)
+                    #     if ranked_neighbors[idx].numel() > 0 and
+                    #     node_to_cluster[ranked_neighbors[idx][0].item()] ==
+                    #     node_to_cluster[idx])
+                    # print(f"Round {rnd:3d} [v2]"
+                    #       f"  R0-TP={r0_tp}/{args.num_spokes}")
 
                     # 5. Aggregate (warmup = isolation, post-warmup = weighted)
                     new_states = pagan_v2_protocol.run_topology_and_aggregate(
@@ -539,7 +534,19 @@ def main(args):
             # ================================================================
             if args.aggregation == 'p2p' and (rnd + 1) % args.eval_time == 0:
 
-                # v2 soft metrics
+                # v2 embedding quality (all rounds including warmup)
+                if args.topo == 'paganv2':
+                    emb_stats = compute_emb_stats(
+                        E_list, node_to_cluster, jsd_matrix)
+                    emb_stats['round'] = rnd
+                    metrics['v2_emb_stats'].append(emb_stats)
+                    print(f"  [emb rnd {rnd:3d}] "
+                          f"tp@5={emb_stats['tp_at_5']:.3f}  "
+                          f"tp@10={emb_stats['tp_at_10']:.3f}  "
+                          f"tp@15={emb_stats['tp_at_15']:.3f}  "
+                          f"tp@20={emb_stats['tp_at_20']:.3f}  "
+                          f"jsd_rho={emb_stats['mean_jsd_rho']:.3f}")
+
                 if args.topo == 'paganv2' and rnd >= args.v2_warmup_rounds:
                     sm = pagan_v2_protocol.compute_soft_metrics(rnd)
                     metrics['v2_soft_metrics'].append(sm)
@@ -597,6 +604,56 @@ def main(args):
     with open(filename + '_metrics.json', 'w') as f:
         json.dump(metrics, f, separators=(',', ':'), indent=None)
     print("Training complete.")
+
+def compute_emb_stats(E_list, ntc, jsd_matrix, ks=(5, 10, 15, 20), spearman_k=10):
+    """
+    Embedding quality metrics:
+      - JSD Spearman@k (oracle: embedding order vs true distributional similarity)
+      - Top-k precision at multiple k values (fraction of embedding top-k that are cluster-mates)
+    """
+    from scipy.stats import spearmanr
+    N = len(E_list)
+
+    per_rho_jsd = np.full(N, np.nan, dtype=np.float32)
+    per_tp = {k_val: np.full(N, np.nan, dtype=np.float32) for k_val in ks}
+
+    jsd_np = jsd_matrix.cpu().numpy() if hasattr(jsd_matrix, 'cpu') \
+             else np.array(jsd_matrix)
+
+    for i in range(N):
+        # ── Embedding distances from i ────────────────────────────────
+        Ei     = E_list[i].detach().cpu().float().numpy()
+        my_emb = Ei[i]
+        emb_d  = np.linalg.norm(Ei - my_emb, axis=1)
+        emb_d[i] = np.inf
+        emb_order = np.argsort(emb_d)
+
+        # ── JSD ground-truth top-k (oracle) ──────────────────────────
+        jsd_row  = jsd_np[i].copy()
+        jsd_row[i] = np.inf
+        jsd_order = np.argsort(jsd_row)
+        jsd_topk  = jsd_order[:spearman_k].tolist()
+
+        # ── JSD Spearman@k ────────────────────────────────────────────
+        emb_ranks_of_jsd = [int(np.where(emb_order == j)[0][0])
+                             for j in jsd_topk]
+        if len(emb_ranks_of_jsd) >= 2:
+            rho, _ = spearmanr(np.arange(len(emb_ranks_of_jsd)),
+                                emb_ranks_of_jsd)
+            if not np.isnan(rho):
+                per_rho_jsd[i] = float(rho)
+
+        # ── Top-k precision at multiple k ─────────────────────────────
+        my_c = ntc[i]
+        for k_val in ks:
+            top_k_nodes = emb_order[:k_val].tolist()
+            tp = sum(1 for j in top_k_nodes if ntc[j] == my_c)
+            per_tp[k_val][i] = tp / k_val
+
+    result = {'mean_jsd_rho': float(np.nanmean(per_rho_jsd))}
+    for k_val in ks:
+        result[f'tp_at_{k_val}'] = float(np.nanmean(per_tp[k_val]))
+    return result
 
 
 if __name__ == "__main__":
