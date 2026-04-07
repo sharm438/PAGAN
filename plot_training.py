@@ -363,3 +363,55 @@ class TrainingPlotter:
         fig.savefig(path, dpi=150, bbox_inches="tight")
         print(f"[plot] -> {path}")
         plt.close(fig)
+
+    # ------------------------------------------------------------------
+    # Embedding top-k precision over training
+    # ------------------------------------------------------------------
+    def embedding_precision(self, ks=(5, 10, 15, 20),
+                            save_name: str = None,
+                            title: str = None):
+        """
+        Line plot of embedding top-k precision (tp@k) across training rounds.
+        Reads from metrics['v2_emb_stats'] logged by compute_emb_stats.
+
+        Usage:
+            tp = TrainingPlotter("outputs/live_emb_25_25_patho1_metrics.json")
+            tp.embedding_precision()
+        """
+        emb_stats = self.metrics.get('v2_emb_stats', [])
+        if not emb_stats:
+            print("[embedding_precision] No v2_emb_stats found in metrics.")
+            return
+
+        rnds = np.array([s['round'] for s in emb_stats])
+
+        fig, ax = plt.subplots(figsize=(13, 5))
+        colors = {'5': '#DD4444', '10': '#4C72B0', '15': '#44AA44', '20': '#AA44AA'}
+
+        for k_val in ks:
+            key = f'tp_at_{k_val}'
+            if key not in emb_stats[0]:
+                continue
+            vals = np.array([s[key] for s in emb_stats])
+            c = colors.get(str(k_val), '#888888')
+            ax.plot(rnds, vals, lw=1.8, color=c, marker='o', markersize=4,
+                    label=f'tp@{k_val}', alpha=0.85)
+
+        # Mark warmup boundary if soft_metrics exist (first entry = warmup end)
+        if self.soft_metrics:
+            warmup_end = self.soft_metrics[0]['round']
+            ax.axvline(x=warmup_end, color='black', lw=1.2, ls='--', alpha=0.5,
+                       label=f'warmup end (r={warmup_end})')
+
+        ax.set_xlabel("Round")
+        ax.set_ylabel("Top-k Precision (fraction cluster-mates)")
+        ax.set_title(title or f"Embedding precision — {self.exp_name}")
+        ax.set_ylim(-0.02, 1.05)
+        ax.legend(fontsize=9, loc='lower right')
+        ax.grid(alpha=0.25)
+
+        plt.tight_layout()
+        path = f"outputs/{save_name or self.exp_name + '_emb_precision.png'}"
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        print(f"[plot] -> {path}")
+        plt.close(fig)
