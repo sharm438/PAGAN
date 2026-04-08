@@ -492,10 +492,15 @@ def main(args):
 
                     # Switch to lower lr post-warmup (if not frozen)
                     if rnd == args.v2_warmup_rounds and not args.v2_freeze_embeddings:
+                        embedding_schedulers = []
                         for opt in embedding_opts:
                             for pg in opt.param_groups:
                                 pg['lr'] = args.v2_emb_lr_post
-                        print(f"[v2] Embedding lr -> {args.v2_emb_lr_post}")
+                            embedding_schedulers.append(
+                                torch.optim.lr_scheduler.ExponentialLR(
+                                    opt, gamma=0.99))
+                        print(f"[v2] Embedding lr -> {args.v2_emb_lr_post} "
+                              f"(scheduler reset)")
 
                     agg.update_embeddings_ladder_triplet(
                         E_list, evidence, opt_list=embedding_opts, steps=steps)
