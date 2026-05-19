@@ -71,7 +71,7 @@ def parse_args():
                                  'tiny_imagenet','cifar100'])
     parser.add_argument("--fraction",       type=float, default=1.0)
     parser.add_argument("--bias",           type=float, default=0.1)
-    parser.add_argument("--aggregation",    type=str,   default='fedavg',
+    parser.add_argument("--aggregation",    type=str,   default='p2p',
                         choices=['isolated','fedsgd','fedavg','p2p'])
     parser.add_argument("--topo",           type=str,   default=None,
                         choices=['k-regular-random','k-regular-clustered',
@@ -97,7 +97,8 @@ def parse_args():
     parser.add_argument("--embed_dim",      type=int,   default=8)
 
     parser.add_argument("--val_frac",       type=float, default=0.0)
-
+    parser.add_argument("--use_external_test", action="store_true",
+                        help="Distribute CIFAR-10 test set with same proportions as train")
     # ── PAGANv2-specific args ──────────────────────────────────────────
     parser.add_argument("--v2_warmup_rounds",   type=int,   default=25)
     parser.add_argument("--v2_ema_lambda",      type=float, default=0.95,
@@ -166,7 +167,7 @@ def main(args):
     else:
         trainObject = utils.load_data(args.dataset, args.batch_size, args.lr, args.fraction)
         data, labels = trainObject.train_data, trainObject.train_labels
-        test_data    = trainObject.test_data
+        test_data    = trainObject.test_data      # global DataLoader (unchanged, for global eval)
         inp_dim      = trainObject.num_inputs
         out_dim      = trainObject.num_outputs
         lr           = args.lr
@@ -199,25 +200,125 @@ def main(args):
         jsd_matrix        = utils.compute_pairwise_jsd(
             distributedData.label_distribution).to(aggregator_device)
 
-    splits = utils._make_local_splits(
-        distributed_data, distributed_label,
-        args.local_test_frac, args.val_frac, args.seed, print_stats=False)
+    # ── Data splits ───────────────────────────────────────────────────
+    if args.use_external_test:
+        # Extract raw tensors from global test DataLoader
+        _bx, _by = [], []
+        for bx, by in trainObject.test_data:
+            _bx.append(bx); _by.append(by)
+        raw_test_data   = torch.cat(_bx, dim=0)
+        raw_test_labels = torch.cat(_by, dim=0)
 
-    if args.local_test_frac > 0:
+        # Train+Val only (no local test carved from train set)
+        splits = utils._make_local_splits(
+            distributed_data, distributed_label,
+            0.0, args.val_frac, args.seed, print_stats=False)
+
+        distributed_train_data  = splits["train_data"]
+        distributed_train_label = splits["train_label"]
+
+        if args.val_frac > 0:
+            distributed_val_data  = splits["val_data"]
+            distributed_val_label = splits["val_label"]
+
+        # Distribute external test set with same per-node class proportions
+        ext_test_data, ext_test_label = utils.distribute_test_data(
+            raw_test_data, raw_test_labels,
+            distributedData.cluster_class_counts,
+            distributedData.node_to_cluster,
+            out_dim, torch.device("cpu"), seed=42)
+        local_test_pairs = list(zip(ext_test_data, ext_test_label))
+
         split_distribution_stats = utils.analyze_train_test_split_distribution(
-            splits["train_label"], splits["test_label"], out_dim)
+            distributed_train_label, ext_test_label, out_dim)
+    else:
+        # Original path: carve local test (and optionally val) from train set
+        splits = utils._make_local_splits(
+            distributed_data, distributed_label,
+            args.local_test_frac, args.val_frac, args.seed, print_stats=False)
 
-    distributed_train_data  = splits["train_data"]
-    distributed_train_label = splits["train_label"]
+        distributed_train_data  = splits["train_data"]
+        distributed_train_label = splits["train_label"]
 
-    if args.local_test_frac > 0:
-        local_test_pairs = list(zip(splits["test_data"], splits["test_label"]))
-    if args.val_frac > 0:
-        distributed_val_data  = splits["val_data"]
-        distributed_val_label = splits["val_label"]
+        if args.local_test_frac > 0:
+            split_distribution_stats = utils.analyze_train_test_split_distribution(
+                splits["train_label"], splits["test_label"], out_dim)
+            local_test_pairs = list(zip(splits["test_data"], splits["test_label"]))
+        if args.val_frac > 0:
+            distributed_val_data  = splits["val_data"]
+            distributed_val_label = splits["val_label"]
 
     if args.eval_local and local_test_pairs is None:
-        print("[Info] --eval_local given but local_test_frac==0.")
+        print("[Info] --eval_local given but no local test data available.")
+
+    # if args.dataset == 'femnist':
+    #     trainObject, distributed_data, distributed_label = utils.load_data(
+    #         args.dataset, 32, args.lr, args.fraction)
+    #     test_data   = trainObject.test_data
+    #     inp_dim     = trainObject.num_inputs
+    #     out_dim     = trainObject.num_outputs
+    #     lr          = args.lr
+    #     batch_size  = trainObject.batch_size
+    #     net_name    = trainObject.net_name
+    #     num_clients = len(distributed_label)
+    #     counts      = torch.tensor([distributed_label[i].shape[0]
+    #                                  for i in range(num_clients)], dtype=torch.float32)
+    #     node_weights = (counts / counts.sum()).to(aggregator_device)
+    # else:
+    #     trainObject = utils.load_data(args.dataset, args.batch_size, args.lr, args.fraction)
+    #     data, labels = trainObject.train_data, trainObject.train_labels
+    #     test_data    = trainObject.test_data
+    #     inp_dim      = trainObject.num_inputs
+    #     out_dim      = trainObject.num_outputs
+    #     lr           = args.lr
+    #     batch_size   = trainObject.batch_size
+    #     net_name     = trainObject.net_name
+
+    #     current_seed = args.seed if args.seed > 0 else 42
+    #     if args.dist_case == 'dirichlet':
+    #         distributedData = utils.clustered_distribute_data(
+    #             (data, labels), num_nodes=args.num_spokes,
+    #             num_clusters=(args.num_spokes if args.num_clusters == 0
+    #                           else args.num_clusters),
+    #             alpha=args.bias, out_dim=out_dim,
+    #             device=torch.device("cpu"), seed=42)
+    #     else:
+    #         cluster_specs = {
+    #             'patho_1': [[0,1,2,3,4],[5,6,7,8,9]],
+    #             'patho_2': [[0,1,2,3],[2,3,4,5],[6,7],[8,9],[0,8]],
+    #             'patho_3': [[0,1,2,3],[5,6,7,8],[4,9]],
+    #         }[args.dist_case]
+    #         distributedData = utils.distribute_data_pathological(
+    #             (data, labels), num_nodes=args.num_spokes,
+    #             cluster_specs=cluster_specs, out_dim=out_dim,
+    #             device=torch.device("cpu"), seed=current_seed)
+
+    #     distributed_data  = distributedData.train_input
+    #     distributed_label = distributedData.train_output
+    #     node_weights      = distributedData.wts.to(aggregator_device)
+    #     node_to_cluster   = np.array(distributedData.node_to_cluster)
+    #     jsd_matrix        = utils.compute_pairwise_jsd(
+    #         distributedData.label_distribution).to(aggregator_device)
+
+    # splits = utils._make_local_splits(
+    #     distributed_data, distributed_label,
+    #     args.local_test_frac, args.val_frac, args.seed, print_stats=False)
+
+    # if args.local_test_frac > 0:
+    #     split_distribution_stats = utils.analyze_train_test_split_distribution(
+    #         splits["train_label"], splits["test_label"], out_dim)
+
+    # distributed_train_data  = splits["train_data"]
+    # distributed_train_label = splits["train_label"]
+
+    # if args.local_test_frac > 0:
+    #     local_test_pairs = list(zip(splits["test_data"], splits["test_label"]))
+    # if args.val_frac > 0:
+    #     distributed_val_data  = splits["val_data"]
+    #     distributed_val_label = splits["val_label"]
+
+    # if args.eval_local and local_test_pairs is None:
+    #     print("[Info] --eval_local given but local_test_frac==0.")
 
     # ── Global model ──────────────────────────────────────────────────
     global_model = models.load_net(net_name, inp_dim, out_dim, aggregator_device)
@@ -316,6 +417,8 @@ def main(args):
         metrics['local_split_stats'] = split_distribution_stats
     if args.num_clusters > 0:
         metrics['node_to_cluster'] = node_to_cluster.tolist()
+    if args.topo == 'paganv2':
+        metrics['v2_warmup_rounds'] = args.v2_warmup_rounds
 
     # ── Training state ────────────────────────────────────────────────
     is_fed_path = args.aggregation in ('fedavg', 'fedsgd')

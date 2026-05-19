@@ -17,6 +17,137 @@ import json
 from typing import List
 from sklearn.model_selection import train_test_split
 
+def distribute_test_data(test_data, test_labels, cluster_class_counts,
+                         node_to_cluster, out_dim, device, seed=42):
+    """
+    Distribute an external test set to nodes using the same class proportions
+    as the training distribution. Maintains per-node class ratios by splitting
+    each class separately within each cluster.
+
+    Args:
+        test_data:              Tensor [M, ...] — full test dataset
+        test_labels:            Tensor [M] — corresponding labels
+        cluster_class_counts:   np.ndarray [num_clusters, out_dim]
+        node_to_cluster:        list[int] — cluster id for each node
+        out_dim:                int — number of classes
+        device:                 torch.device
+        seed:                   int
+
+    Returns:
+        (per_node_data, per_node_labels): lists of tensors, one per node
+    """
+    rng = np.random.default_rng(seed)
+
+    num_clusters = cluster_class_counts.shape[0]
+    num_nodes = len(node_to_cluster)
+
+    # Nodes per cluster
+    nodes_per_cluster = [0] * num_clusters
+    for cid in node_to_cluster:
+        nodes_per_cluster[cid] += 1
+
+    node_base_offsets = []
+    offset = 0
+    for cnt in nodes_per_cluster:
+        node_base_offsets.append(offset)
+        offset += cnt
+
+    # Per-class index pools in test set
+    class_indices = [[] for _ in range(out_dim)]
+    for i, lbl in enumerate(test_labels):
+        class_indices[int(lbl.item())].append(i)
+    for cls in range(out_dim):
+        rng.shuffle(class_indices[cls])
+
+    # Proportional allocation of test samples to clusters (per class)
+    class_totals = cluster_class_counts.sum(axis=0)  # [out_dim]
+    cluster_test_counts = np.zeros((num_clusters, out_dim), dtype=int)
+
+    for cls in range(out_dim):
+        test_class_size = len(class_indices[cls])
+        if test_class_size == 0 or class_totals[cls] == 0:
+            continue
+
+        props = cluster_class_counts[:, cls].astype(float) / class_totals[cls]
+        raw = props * test_class_size
+        alloc = np.floor(raw).astype(int)
+
+        leftover = test_class_size - alloc.sum()
+        if leftover > 0:
+            fracs = raw - alloc
+            order = np.argsort(-fracs)
+            for idx in order:
+                if leftover == 0:
+                    break
+                alloc[idx] += 1
+                leftover -= 1
+
+        cluster_test_counts[:, cls] = alloc
+
+    # Build per-cluster, per-class index lists
+    per_class_ptr = [0] * out_dim
+    cluster_class_idx = [[[] for _ in range(out_dim)] for _ in range(num_clusters)]
+
+    for cid in range(num_clusters):
+        for cls in range(out_dim):
+            k = int(cluster_test_counts[cid, cls])
+            if k > 0:
+                start = per_class_ptr[cls]
+                end = start + k
+                cluster_class_idx[cid][cls] = class_indices[cls][start:end]
+                per_class_ptr[cls] = end
+
+    # Stage 2: split each class within each cluster across its nodes
+    per_node_indices = [[] for _ in range(num_nodes)]
+
+    for cid in range(num_clusters):
+        c_nodes = nodes_per_cluster[cid]
+        if c_nodes == 0:
+            continue
+        base_idx = node_base_offsets[cid]
+
+        for cls in range(out_dim):
+            cls_idx = cluster_class_idx[cid][cls]
+            cls_size = len(cls_idx)
+            if cls_size == 0:
+                continue
+
+            sizes = [cls_size // c_nodes] * c_nodes
+            for i in range(cls_size % c_nodes):
+                sizes[i] += 1
+
+            start = 0
+            for j in range(c_nodes):
+                end = start + sizes[j]
+                node_idx = base_idx + j
+                per_node_indices[node_idx].extend(cls_idx[start:end])
+                start = end
+
+    # Shuffle and build tensors
+    per_node_data = [None] * num_nodes
+    per_node_labels = [None] * num_nodes
+
+    for i in range(num_nodes):
+        idx = per_node_indices[i]
+        if len(idx) > 0:
+            rng.shuffle(idx)
+            per_node_data[i] = torch.stack(
+                [test_data[k] for k in idx]).to(device)
+            per_node_labels[i] = torch.tensor(
+                [int(test_labels[k].item()) for k in idx],
+                dtype=torch.long, device=device)
+        else:
+            per_node_data[i] = torch.empty(0, *test_data.shape[1:], device=device)
+            per_node_labels[i] = torch.empty(0, dtype=torch.long, device=device)
+
+    total_distributed = sum(len(d) for d in per_node_data)
+    print(f"[TestDist] Distributed {total_distributed}/{len(test_data)} test samples "
+          f"across {num_nodes} nodes "
+          f"(min={min(len(d) for d in per_node_data)}, "
+          f"max={max(len(d) for d in per_node_data)})")
+
+    return per_node_data, per_node_labels
+
 def _make_local_splits(distributed_data, distributed_label, local_test_frac, local_val_frac, seed, print_stats=False):
     """
     Splits data into Train, Test, and optional Validation sets using stratified sampling.
@@ -161,12 +292,15 @@ class DistributedData:
     def __init__(self,
                  train_input, train_output,
                  wts=None, label_distribution=None,
-                 node_to_cluster=None):
+                 node_to_cluster=None,
+                 cluster_class_counts=None):
         self.train_input = train_input
         self.train_output = train_output
         self.wts = wts
         self.label_distribution = label_distribution
         self.node_to_cluster = node_to_cluster  # list[int] of cluster id per node
+        self.cluster_class_counts = cluster_class_counts  # np.ndarray [num_clusters, out_dim]
+
 
 ## Added on 120925
 from scipy.spatial.distance import jensenshannon
@@ -796,8 +930,9 @@ def clustered_distribute_data(
           f"| per-node (min/med/max) = "
           f"{int(sizes.min().item())}/{int(torch.median(sizes).item())}/{int(sizes.max().item())}")
    
+    ccc = np.array([cluster_class_counts[cid] for cid in range(num_clusters)])
     return DistributedData(
-        train_input, train_output, wts, label_distribution, node_to_cluster
+        train_input, train_output, wts, label_distribution, node_to_cluster, ccc
     )
 
 # ----------------------------
@@ -1034,8 +1169,13 @@ def distribute_data_pathological(
     _print_node_size_stats([int(s.item()) for s in sizes])
     print(f"[Data Dist] Pathological split complete. node_to_cluster map: {node_to_cluster}")
     
+    # Build cluster_class_counts from label_chunks
+    ccc = np.zeros((num_clusters, out_dim), dtype=int)
+    for (cid, lbl), (start, end) in label_chunks.items():
+        ccc[cid, lbl] = end - start
+
     return DistributedData(
-        train_input, train_output, wts, label_distribution, node_to_cluster
+        train_input, train_output, wts, label_distribution, node_to_cluster, ccc
     )
 
 def _print_node_size_stats(sizes_list):
