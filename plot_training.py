@@ -332,7 +332,7 @@ class TrainingPlotter:
             total = reg.R
             # rounds_to_plot = [total // 5, 2*total//5,
             #                     3*total//5, 4*total//5, total-1]
-            rounds_to_plot = [20, 25, 30, 40, 50]
+            rounds_to_plot = [25, 50, 100, 250, 500]
         num_clusters = int(ntc.max()) + 1
         cmap_c = cm.get_cmap("tab20", max(num_clusters, 2))
 
@@ -399,7 +399,10 @@ class TrainingPlotter:
 
         # Mark warmup boundary if soft_metrics exist (first entry = warmup end)
         if self.soft_metrics:
-            warmup_end = self.soft_metrics[0]['round']
+            #warmup_end = self.soft_metrics[0]['round']
+            warmup_end = self.metrics.get('v2_warmup_rounds', None)
+            if warmup_end == None:
+                warmup_end = self.soft_metrics[0]['round']
             ax.axvline(x=warmup_end, color='black', lw=1.2, ls='--', alpha=0.5,
                        label=f'warmup end (r={warmup_end})')
 
