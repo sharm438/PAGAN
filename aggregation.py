@@ -947,7 +947,10 @@ def update_embeddings_ladder_triplet(
     neighbor_ranklists_with_dists, 
     opt_list, 
     steps=10,
-    alpha=2.0 # Scale factor for dynamic margin
+    alpha=2.0,  # Scale factor for dynamic margin
+    trust_weights=None,  # Optional parallel structure: trust_weights[i] is a list
+                          # of floats (one per evidence item) used as trust_weight.
+                          # If None, trust_weight defaults to 1.0 (back-compat).
 ):
     N = len(E_list)
     
@@ -957,6 +960,12 @@ def update_embeddings_ladder_triplet(
         
         evidence = neighbor_ranklists_with_dists[i]
         if not evidence: continue
+
+        # Resolve per-evidence trust weights, defaulting to 1.0 each
+        if trust_weights is not None and i < len(trust_weights):
+            tw_list = trust_weights[i]
+        else:
+            tw_list = [1.0] * len(evidence)
         
         for _ in range(steps):
             optimizer.zero_grad()
@@ -970,8 +979,10 @@ def update_embeddings_ladder_triplet(
                 if M < 2: continue
                 
                 # --- EXTERNAL WEIGHT (Trusting the Neighbor) ---
-                # We trust our closer friends' maps more. (Inverse Square Root)
-                trust_weight = 1.0 #/ ((rank_idx + 1) ** 0.5)
+                # v3: trust_weights from PAGANv3 (per-pair trust score).
+                # v2/legacy: 1.0 for all evidence (unchanged).
+                trust_weight = (float(tw_list[rank_idx])
+                                  if rank_idx < len(tw_list) else 1.0)
                 
                 # 1. Anchored Embeddings
                 center_emb = Ei[anchor_id].unsqueeze(0)

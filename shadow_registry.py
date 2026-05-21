@@ -57,11 +57,18 @@ class ShadowRegistry:
         np.fill_diagonal(self.ema_dist, 0.0)
 
     # ------------------------------------------------------------------
-    def record(self, rnd: int, ranked_neighbors: list, ranked_dists: list):
+    def record(self, rnd: int, ranked_neighbors: list, ranked_dists: list,
+               lambda_matrix: np.ndarray = None):
         """
         Call once per round after rank_neighbors_by_model_distance.
         ranked_neighbors[i] : LongTensor sorted closest-first.
         ranked_dists[i]     : FloatTensor of squared-L2, aligned.
+
+        Parameters
+        ----------
+        lambda_matrix : np.ndarray of shape [N, N], optional
+            Per-pair EMA decay. If None, uses self.lam (back-compat).
+            Used by PAGANv3 to apply asymmetric inertia.
         """
         if rnd >= self.R:
             return
@@ -81,13 +88,14 @@ class ShadowRegistry:
                 self.shadow_rank[i, j, rnd] = float(rank_pos)
                 self.shadow_dist[i, j, rnd] = d
 
-            # ── EMA distance update ────────────────────────────────────
+            # ── EMA distance update (per-pair lambda if provided) ─────
             for j, d in zip(nbrs_np, l2_np):
+                lam_ij = float(lambda_matrix[i, j]) if lambda_matrix is not None else self.lam
                 if self.ema_dist[i, j] < 0.0:     # first observation
                     self.ema_dist[i, j] = d
                 else:
-                    self.ema_dist[i, j] = (self.lam * self.ema_dist[i, j]
-                                           + (1.0 - self.lam) * d)
+                    self.ema_dist[i, j] = (lam_ij * self.ema_dist[i, j]
+                                           + (1.0 - lam_ij) * d)
 
             # ── Diagnostic softmax weights (includes self at d=0) ──────
             all_ids = np.append(nbrs_np, i)
