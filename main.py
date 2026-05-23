@@ -60,6 +60,8 @@ from pagan_v2 import PAGANv2
 # PAGANv3
 from pagan_v3 import PAGANv3
 
+from fedspd import FedSPD
+
 
 # -----------------------------------------------------------------------
 # Args
@@ -77,7 +79,7 @@ def parse_args():
                         choices=['isolated','fedsgd','fedavg','p2p'])
     parser.add_argument("--topo",           type=str,   default=None,
                         choices=['k-regular-random','k-regular-clustered',
-                                 'pagan','dpfl','paganv2','paganv3'])
+                                 'pagan','dpfl','paganv2','paganv3', 'fedspd'])
     parser.add_argument("--num_spokes",     type=int,   default=100)
     parser.add_argument("--num_clusters",   type=int,   default=0)
     parser.add_argument("--num_rounds",     type=int,   default=500)
@@ -149,6 +151,14 @@ def parse_args():
     parser.add_argument("--v3_trust_w_warmup",    type=float, default=1.0)
     parser.add_argument("--v3_trust_w_vouch",     type=float, default=1.0)
     parser.add_argument("--v3_trust_w_embed",     type=float, default=1.0)
+    # ── FedSPD-specific args ──────────────────────────────────────────
+    parser.add_argument("--fedspd_S",    type=int,   default=2,
+                        help="Number of cluster centers per node.")
+    parser.add_argument("--fedspd_ckc",  type=int,   default=10,
+                        help="Label-switch alignment every N rounds.")
+    parser.add_argument("--fedspd_init", type=str,   default='fedspd_style',
+                        choices=['fedspd_style', 'round_robin'],
+                        help="Cluster center + data initialization strategy.")
 
     return parser.parse_args()
 
@@ -470,6 +480,30 @@ def main(args):
               f"λ_safe={args.v3_lambda_safe}/λ_cautious={args.v3_lambda_cautious}  "
               f"case2 trigger={args.v3_case2_trigger_K}/exit={args.v3_case2_exit_K}  "
               f"embed_mature@{args.v3_emb_mature_round}")
+    
+    global_wts  = utils.model_to_vec(global_model)
+    # ── FedSPD init ─────────
+    fedspd_protocol = None
+    if args.aggregation == 'p2p' and args.topo == 'fedspd':
+        D = global_wts.shape[0]
+        fedspd_protocol = FedSPD(
+            N=args.num_spokes,
+            S=args.fedspd_S,
+            D=D,
+            net_name=net_name,
+            inp_dim=inp_dim,
+            out_dim=out_dim,
+            device=aggregator_device,
+            k=args.k,
+            seed=args.seed,
+            train_data=distributed_train_data,
+            train_labels=distributed_train_label,
+            lr=args.lr,
+            batch_size=batch_size,
+            num_local_iters=args.num_local_iters,
+            init_style=args.fedspd_init,
+            ckc=args.fedspd_ckc,
+        )
 
     # ── DPFL init ─────────────────────────────────────────────────────
     if args.aggregation == 'p2p' and args.topo == 'dpfl':
@@ -514,7 +548,7 @@ def main(args):
     # ── Training state ────────────────────────────────────────────────
     is_fed_path = args.aggregation in ('fedavg', 'fedsgd')
     local_iters_effective = 1 if args.aggregation == 'fedsgd' else args.num_local_iters
-    global_wts  = utils.model_to_vec(global_model)
+    
     node_states = global_wts.detach().unsqueeze(0).repeat(
         args.num_spokes, 1).to(aggregator_device)
 
@@ -532,30 +566,60 @@ def main(args):
     try:
         for rnd in range(args.num_rounds):
 
+            # # ── Local training ────────────────────────────────────────
+            # if args.aggregation in ('fedavg', 'fedsgd'):
+            #     start_vec   = global_wts.detach()
+            #     node_states = start_vec.unsqueeze(0).repeat(args.num_spokes, 1)
+
+            # velocities = []
+            # for node_id in range(args.num_spokes):
+            #     start_vec = None
+            #     if args.aggregation in ('isolated', 'p2p'):
+            #         start_vec = node_states[node_id].detach().clone()
+
+            #     updated_wts = train_node.local_train_worker_inline(
+            #         node_id, start_vec,
+            #         distributed_train_data[node_id],
+            #         distributed_train_label[node_id],
+            #         inp_dim, out_dim, net_name,
+            #         local_iters_effective, batch_size, args.lr,
+            #         aggregator_device, args.sample_type, rr_indices)
+
+            #     if args.topo in ('pagan', 'paganv2', 'paganv3') and start_vec is not None:
+            #         velocities.append(
+            #             torch.norm(updated_wts - start_vec).item())
+
+            #     node_states[node_id] = updated_wts.detach()
+
             # ── Local training ────────────────────────────────────────
             if args.aggregation in ('fedavg', 'fedsgd'):
                 start_vec   = global_wts.detach()
                 node_states = start_vec.unsqueeze(0).repeat(args.num_spokes, 1)
 
-            velocities = []
-            for node_id in range(args.num_spokes):
-                start_vec = None
-                if args.aggregation in ('isolated', 'p2p'):
-                    start_vec = node_states[node_id].detach().clone()
+            # ── FedSPD: train + aggregate + recluster in one call ─────
+            if args.aggregation == 'p2p' and args.topo == 'fedspd':
+                node_states = fedspd_protocol.run_round(
+                    rnd, distributed_train_data, distributed_train_label)
+            else:
+                velocities = []
+                for node_id in range(args.num_spokes):
+                    start_vec = None
+                    if args.aggregation in ('isolated', 'p2p'):
+                        start_vec = node_states[node_id].detach().clone()
 
-                updated_wts = train_node.local_train_worker_inline(
-                    node_id, start_vec,
-                    distributed_train_data[node_id],
-                    distributed_train_label[node_id],
-                    inp_dim, out_dim, net_name,
-                    local_iters_effective, batch_size, args.lr,
-                    aggregator_device, args.sample_type, rr_indices)
+                    updated_wts = train_node.local_train_worker_inline(
+                        node_id, start_vec,
+                        distributed_train_data[node_id],
+                        distributed_train_label[node_id],
+                        inp_dim, out_dim, net_name,
+                        local_iters_effective, batch_size, args.lr,
+                        aggregator_device, args.sample_type, rr_indices)
 
-                if args.topo in ('pagan', 'paganv2', 'paganv3') and start_vec is not None:
-                    velocities.append(
-                        torch.norm(updated_wts - start_vec).item())
+                    if args.topo in ('pagan', 'paganv2', 'paganv3') and start_vec is not None:
+                        velocities.append(
+                            torch.norm(updated_wts - start_vec).item())
 
-                node_states[node_id] = updated_wts.detach()
+                    node_states[node_id] = updated_wts.detach()
 
             # ── Aggregation ───────────────────────────────────────────
             if args.aggregation == 'isolated':
@@ -793,7 +857,10 @@ def main(args):
                     else:
                         W_dpfl[i, i] = 1.0
                 node_states = agg.p2p_aggregation(node_states, W_dpfl).detach()
-
+            
+            elif args.aggregation == 'p2p' and args.topo == 'fedspd':
+                pass  # training + aggregation already handled in run_round above
+            
             elif args.aggregation == 'p2p':
                 if args.topo == 'k-regular-random':
                     _, W_local = agg.k_regular_random(
