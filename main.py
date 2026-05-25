@@ -126,32 +126,21 @@ def parse_args():
     parser.add_argument("--v2_emb_steps",      type=int,   default=10)
     parser.add_argument("--v2_eff_thresh",      type=float, default=0.02)
 
-    # ── PAGANv3-specific args ──────────────────────────────────────────
-    # v3 reuses all v2_* args (warmup, ema_lambda, tau_*, etc.) for its
-    # underlying mechanics. The v3_* args below are the new trust/Case-2 knobs.
-    parser.add_argument("--v3_lambda_safe",       type=float, default=0.85,
-                        help="EMA decay for safe-direction updates (fast).")
-    parser.add_argument("--v3_lambda_cautious",   type=float, default=0.97,
-                        help="EMA decay for risky-direction updates (slow).")
-    parser.add_argument("--v3_case2_trigger_K",   type=int,   default=2,
-                        help="Consecutive drift flags to enter Case 2.")
-    parser.add_argument("--v3_case2_exit_K",      type=int,   default=2,
-                        help="Consecutive consistent obs to exit Case 2.")
-    parser.add_argument("--v3_bucket_drift",      type=int,   default=2,
-                        help="Bucket change >= this triggers Case 2 candidate.")
-    parser.add_argument("--v3_n_buckets",         type=int,   default=4,
-                        help="Number of rank buckets (top/upper/lower/bottom).")
-    parser.add_argument("--v3_peer_top_K",        type=int,   default=5,
-                        help="Top-K trusted peers used for vouching.")
-    parser.add_argument("--v3_emb_mature_round",  type=int,   default=200,
-                        help="Round at which embedding term enters trust score.")
-    parser.add_argument("--v3_trust_recompute",   type=int,   default=5,
-                        help="Recompute trust scores every N rounds post-warmup.")
-    parser.add_argument("--v3_trust_high_thresh", type=float, default=0.5,
-                        help="Trust score above this counts as 'high-trust'.")
-    parser.add_argument("--v3_trust_w_warmup",    type=float, default=1.0)
-    parser.add_argument("--v3_trust_w_vouch",     type=float, default=1.0)
-    parser.add_argument("--v3_trust_w_embed",     type=float, default=1.0)
+    # v3 reuses all v2_* args (warmup, ema_lambda, tau_*, emb_*).
+    # Only the blend schedule and triplet scheme are new.
+    parser.add_argument("--v3_alpha_start",    type=int,   default=None,
+                        help="Round where α begins decaying from 1.0. "
+                             "Default: v2_warmup_rounds.")
+    parser.add_argument("--v3_alpha_end",      type=int,   default=None,
+                        help="Round where α reaches 0.0 (pure embedding). "
+                             "Default: num_rounds.")
+    parser.add_argument("--v3_triplet_scheme", type=str,   default='flat',
+                        choices=['flat', 'inv_rank', 'inv_sqrt_rank'],
+                        help="Triplet loss rank-weighting scheme. "
+                             "'flat'=v2 baseline, 'inv_rank'=1/(r+1), "
+                             "'inv_sqrt_rank'=1/sqrt(r+1).")
+
+
     # ── FedSPD-specific args ──────────────────────────────────────────
     parser.add_argument("--fedspd_S",    type=int,   default=2,
                         help="Number of cluster centers per node.")
@@ -446,12 +435,13 @@ def main(args):
               f"freeze_emb={args.v2_freeze_embeddings}")
 
     # ── PAGANv3 init ──────────────────────────────────────────────────
+    pagan_v3_protocol = None
     if args.aggregation == 'p2p' and args.topo == 'paganv3':
         N = args.num_spokes
         g = torch.Generator(device=aggregator_device)
         g.manual_seed(args.seed if args.seed and args.seed > 0 else 123456789)
-        E_list = agg.init_identical_E_list(N, args.embed_dim, aggregator_device, g)
-
+        E_list = agg.init_identical_E_list(N, args.embed_dim,
+                                           aggregator_device, g)
         embedding_opts = []
         embedding_schedulers = []
         for i in range(N):
@@ -460,44 +450,30 @@ def main(args):
             embedding_opts.append(opt)
             embedding_schedulers.append(
                 torch.optim.lr_scheduler.ExponentialLR(opt, gamma=0.99))
-
+ 
         pagan_v3_protocol = PAGANv3(
-            num_nodes         = N,
-            device            = aggregator_device,
-            total_rounds      = args.num_rounds,
-            warmup_rounds     = args.v2_warmup_rounds,
-            ema_lambda        = args.v2_ema_lambda,
-            tau_0             = args.v2_tau_0,
-            tau_min           = args.v2_tau_min,
-            tau_half_life     = args.v2_tau_half_life,
-            softmax_tau       = args.v2_softmax_tau,
-            shadow_window     = args.v2_shadow_window,
-            k_sample          = args.k,
-            freeze_ema        = args.v2_freeze_ema,
-            freeze_embeddings = args.v2_freeze_embeddings,
-            node_to_cluster   = node_to_cluster,
-            eff_weight_thresh = args.v2_eff_thresh,
-            debug_node        = 0,
-            # v3-specific
-            lambda_safe              = args.v3_lambda_safe,
-            lambda_cautious          = args.v3_lambda_cautious,
-            case2_trigger_K          = args.v3_case2_trigger_K,
-            case2_exit_K             = args.v3_case2_exit_K,
-            n_buckets                = args.v3_n_buckets,
-            bucket_drift_threshold   = args.v3_bucket_drift,
-            peer_trust_top_K         = args.v3_peer_top_K,
-            embedding_maturity_round = args.v3_emb_mature_round,
-            trust_recompute_every    = args.v3_trust_recompute,
-            trust_high_threshold     = args.v3_trust_high_thresh,
-            trust_weight_components  = (args.v3_trust_w_warmup,
-                                         args.v3_trust_w_vouch,
-                                         args.v3_trust_w_embed),
+            num_nodes            = N,
+            device               = aggregator_device,
+            total_rounds         = args.num_rounds,
+            warmup_rounds        = args.v2_warmup_rounds,
+            ema_lambda           = args.v2_ema_lambda,
+            tau_0                = args.v2_tau_0,
+            tau_min              = args.v2_tau_min,
+            tau_half_life        = args.v2_tau_half_life,
+            softmax_tau          = args.v2_softmax_tau,
+            shadow_window        = args.v2_shadow_window,
+            freeze_ema           = args.v2_freeze_ema,
+            freeze_embeddings    = args.v2_freeze_embeddings,
+            node_to_cluster      = node_to_cluster,
+            eff_weight_thresh    = args.v2_eff_thresh,
+            debug_node           = 0,
+            alpha_start          = args.v3_alpha_start,
+            alpha_end            = args.v3_alpha_end,
+            triplet_weight_scheme= args.v3_triplet_scheme,
         )
+        # metrics['v3_soft_metrics'] = []
+        # metrics['v3_emb_stats']    = []
 
-        print(f"[PAGANv3] warmup={args.v2_warmup_rounds}  "
-              f"λ_safe={args.v3_lambda_safe}/λ_cautious={args.v3_lambda_cautious}  "
-              f"case2 trigger={args.v3_case2_trigger_K}/exit={args.v3_case2_exit_K}  "
-              f"embed_mature@{args.v3_emb_mature_round}")
     
     global_wts  = utils.model_to_vec(global_model)
     # ── FedSPD init ─────────
@@ -603,8 +579,6 @@ def main(args):
         # v3-specific
         'v3_soft_metrics': [],
         'v3_emb_stats': [],
-        'v3_trust_snapshots': [],
-        'v3_case2_events': [],
         'v4_soft_metrics': [],
         'v4_emb_stats': [],
         'v4_trust_snapshots': [],
@@ -615,9 +589,9 @@ def main(args):
         metrics['node_to_cluster'] = node_to_cluster.tolist()
     if args.topo == 'paganv2':
         metrics['v2_warmup_rounds'] = args.v2_warmup_rounds
-    if args.topo == 'paganv3':
-        metrics['v3_warmup_rounds'] = args.v2_warmup_rounds
-        metrics['v3_emb_mature_round'] = args.v3_emb_mature_round
+    # if args.topo == 'paganv3':
+    #     metrics['v3_warmup_rounds'] = args.v2_warmup_rounds
+    #     metrics['v3_emb_mature_round'] = args.v3_emb_mature_round
     if args.topo == 'paganv4':
         metrics['v4_warmup_rounds'] = args.v2_warmup_rounds
 
@@ -845,11 +819,11 @@ def main(args):
                 prev_ranked_dists     = ranked_dists
 
             # ================================================================
-            # PAGANv3 — trust-aware, asymmetric inertia + Case-2 defense
+            # PAGANv3 — blended model+embedding affinity
             # ================================================================
             elif args.aggregation == 'p2p' and args.topo == 'paganv3':
                 with torch.no_grad():
-                    # 1. Build sampling targets (same 4-slot quota as v2)
+                    # 1. Sampling targets (identical 4-slot quota to v2)
                     neigh_lists = []
                     for i in range(args.num_spokes):
                         phys_list = (prev_ranked_neighbors[i].tolist()
@@ -857,26 +831,26 @@ def main(args):
                         targets_i = pagan_v3_protocol.get_sampling_targets(
                             rnd, i, args.k, phys_list, E_list[i])
                         neigh_lists.append(torch.tensor(
-                            targets_i, device=aggregator_device, dtype=torch.long))
-
-                    # 2. Rank by physical model distance
+                            targets_i, device=aggregator_device,
+                            dtype=torch.long))
+ 
+                    # 2. Physical distance ranking
                     ranked_neighbors, ranked_dists = \
-                        agg.rank_neighbors_by_model_distance(node_states, neigh_lists)
-
-                    # 3. Record into shadow registry
-                    #    (v3 branches internally: warmup uses single λ;
-                    #     post-warmup uses per-pair λ via asymmetric inertia)
+                        agg.rank_neighbors_by_model_distance(
+                            node_states, neigh_lists)
+ 
+                    # 3. Record EMA (identical to v2)
                     pagan_v3_protocol.record(rnd, ranked_neighbors, ranked_dists)
-
-                    # 4. Aggregate
+ 
+                    # 4. Blended aggregation
                     new_states = pagan_v3_protocol.run_topology_and_aggregate(
                         rnd, node_states, E_list, ranked_neighbors,
                         prev_ranked_neighbors)
                     node_states.copy_(new_states)
-
-                # 5. Embedding update with trust-weighted evidence
-                emb_frozen = (args.v2_freeze_embeddings and
-                              rnd >= args.v2_warmup_rounds)
+ 
+                # 5. Embedding update with rank-weighted triplet loss
+                emb_frozen = (args.v2_freeze_embeddings
+                              and rnd >= args.v2_warmup_rounds)
                 if not emb_frozen and prev_ranked_neighbors is not None:
                     selection = [
                         torch.cat([ranked_neighbors[i],
@@ -887,13 +861,14 @@ def main(args):
                     evidence = agg.gather_neighbor_ranklists_with_dists(
                         prev_ranked_neighbors, prev_ranked_dists,
                         chosen_neighbors=selection)
-
-                    # v3: get per-evidence trust weights from protocol
-                    trust_weights = pagan_v3_protocol.get_trust_weights_for_evidence(evidence)
-
+ 
+                    # Rank-weighted triplet evidence
+                    evidence_weights = pagan_v3_protocol.get_evidence_weights(
+                        evidence)
+ 
                     steps = (args.v2_emb_steps if rnd < args.v2_warmup_rounds
                              else max(1, args.v2_emb_steps // 2))
-
+ 
                     if rnd == args.v2_warmup_rounds and not args.v2_freeze_embeddings:
                         embedding_schedulers = []
                         for opt in embedding_opts:
@@ -902,22 +877,20 @@ def main(args):
                             embedding_schedulers.append(
                                 torch.optim.lr_scheduler.ExponentialLR(
                                     opt, gamma=0.99))
-                        print(f"[v3] Embedding lr -> {args.v2_emb_lr_post} "
-                              f"(scheduler reset)")
-
+                        print(f"[v3] Embedding lr -> {args.v2_emb_lr_post}")
+ 
                     agg.update_embeddings_ladder_triplet(
-                        E_list, evidence, opt_list=embedding_opts, steps=steps,
-                        trust_weights=trust_weights)
+                        E_list, evidence,
+                        opt_list=embedding_opts,
+                        steps=steps,
+                        trust_weights=evidence_weights)
+ 
                     for sch in embedding_schedulers:
                         sch.step()
-
-                # 6. Recompute trust scores periodically (post-warmup)
-                if (rnd >= args.v2_warmup_rounds
-                        and (rnd - args.v2_warmup_rounds) % args.v3_trust_recompute == 0):
-                    pagan_v3_protocol.update_trust_scores(rnd, E_list)
-
+ 
                 prev_ranked_neighbors = ranked_neighbors
                 prev_ranked_dists     = ranked_dists
+
 
             elif args.aggregation == 'p2p' and args.topo == 'paganv4':
                 with torch.no_grad():
@@ -1042,6 +1015,18 @@ def main(args):
                           f"self_w={sm.get('avg_self_weight',0):.3f}")
 
                 # v3 embedding quality (all rounds including warmup)
+                if args.topo == 'paganv3' and rnd >= args.v2_warmup_rounds:
+                    sm = pagan_v3_protocol.compute_soft_metrics(rnd)
+                    metrics['v3_soft_metrics'].append(sm)
+ 
+                    b = sm.get('blended', {})
+                    m = sm.get('model',   {})
+                    e = sm.get('emb',     {})
+                    print(f"  [v3 rnd {rnd:3d}] α={sm['alpha']:.3f}  "
+                          f"blend: tp={b.get('tp',0)} fp={b.get('fp',0)}  "
+                          f"model: tp={m.get('tp',0)} fp={m.get('fp',0)}  "
+                          f"emb:   tp={e.get('tp',0)} fp={e.get('fp',0)}")
+ 
                 if args.topo == 'paganv3':
                     emb_stats = compute_emb_stats(
                         E_list, node_to_cluster, jsd_matrix)
@@ -1050,19 +1035,7 @@ def main(args):
                     print(f"  [v3 emb rnd {rnd:3d}] "
                           f"tp@5={emb_stats['tp_at_5']:.3f}  "
                           f"tp@10={emb_stats['tp_at_10']:.3f}  "
-                          f"tp@15={emb_stats['tp_at_15']:.3f}  "
-                          f"tp@20={emb_stats['tp_at_20']:.3f}  "
-                          f"jsd_rho={emb_stats['mean_jsd_rho']:.3f}")
-
-                if args.topo == 'paganv3' and rnd >= args.v2_warmup_rounds:
-                    sm = pagan_v3_protocol.compute_soft_metrics(rnd)
-                    metrics['v3_soft_metrics'].append(sm)
-                    print(f"  [v3 soft] tp={sm.get('tp',0)}  "
-                          f"fp={sm.get('fp',0)}  "
-                          f"fn={sm.get('fn',0)}  "
-                          f"self_w={sm.get('avg_self_weight',0):.3f}  "
-                          f"case2={sm.get('case2_total',0)}  "
-                          f"trust_mean={sm.get('trust_mean',0):.3f}")
+                          f"tp@15={emb_stats['tp_at_15']:.3f}")
 
                 if args.topo == 'paganv4':
                     emb_stats = compute_emb_stats(
@@ -1130,16 +1103,8 @@ def main(args):
         pagan_v3_protocol.registry.save(filename + '_shadow')
         if pagan_v3_protocol.soft_metrics_log:
             metrics['v3_soft_metrics'] = pagan_v3_protocol.soft_metrics_log
-        # Trust snapshots and Case-2 events
-        metrics['v3_trust_snapshots'] = pagan_v3_protocol.trust_snapshots
-        metrics['v3_case2_events'] = pagan_v3_protocol.case2_events
-        # Final trust matrix (for offline analysis)
-        np.savez_compressed(filename + '_v3_trust',
-                            trust=pagan_v3_protocol.trust,
-                            warmup_bucket=pagan_v3_protocol.warmup_bucket,
-                            warmup_count=pagan_v3_protocol.warmup_count,
-                            case2_active=pagan_v3_protocol.case2_active)
-        print(f"[PAGANv3] Saved trust state -> {filename}_v3_trust.npz")
+        print(f"[PAGANv3] Saved registry -> {filename}_shadow")
+
 
     if args.topo == 'paganv4':
         pagan_v4_protocol.registry.save(filename + '_shadow')
