@@ -62,6 +62,7 @@ from pagan_v3 import PAGANv3
 from pagan_v4 import PAGANv4
 
 from fedspd import FedSPD
+from l2c import L2CProtocol
 
 
 # -----------------------------------------------------------------------
@@ -80,7 +81,7 @@ def parse_args():
                         choices=['isolated','fedsgd','fedavg','p2p'])
     parser.add_argument("--topo",           type=str,   default=None,
                         choices=['k-regular-random','k-regular-clustered',
-                                 'pagan','dpfl','paganv2','paganv3', 'paganv4', 'fedspd'])
+                                 'pagan','dpfl','paganv2','paganv3', 'paganv4', 'fedspd', 'l2c'])
     parser.add_argument("--num_spokes",     type=int,   default=100)
     parser.add_argument("--num_clusters",   type=int,   default=0)
     parser.add_argument("--num_rounds",     type=int,   default=500)
@@ -149,6 +150,11 @@ def parse_args():
     parser.add_argument("--fedspd_init", type=str,   default='fedspd_style',
                         choices=['fedspd_style', 'round_robin'],
                         help="Cluster center + data initialization strategy.")
+    # ── L2C-specific args ─────────────────────────────────────────────
+    parser.add_argument("--l2c_beta",    type=float, default=0.01,
+                        help="Learning rate for L2C mixing weight logits.")
+    parser.add_argument("--l2c_warmup",  type=int,   default=25,
+                        help="Rounds of random sampling before topology freeze.")
 
     # ── PAGANv4-specific args ──────────────────────────────────────────
     # v4 reuses all v2_* args for EMA, warmup, tau schedule.
@@ -498,6 +504,22 @@ def main(args):
             init_style=args.fedspd_init,
             ckc=args.fedspd_ckc,
         )
+
+    # ── L2C init ──────────────────────────────────────────────────────
+    l2c_protocol = None
+    if args.aggregation == 'p2p' and args.topo == 'l2c':
+        if distributed_val_data is None or all(len(v) == 0 for v in distributed_val_data):
+            raise ValueError("[L2C] Requires --val_frac > 0 to provide local validation sets.")
+        l2c_protocol = L2CProtocol(
+            N=args.num_spokes,
+            k=args.k,
+            warmup_rounds=args.l2c_warmup,
+            beta=args.l2c_beta,
+            device=aggregator_device,
+            seed=args.seed,
+        )
+        print(f"[L2C] N={args.num_spokes}  k={args.k}  "
+              f"warmup={args.l2c_warmup}  beta={args.l2c_beta}")
 
     # ── PAGANv4 init ──────────────────────────────────────────────────
     pagan_v4_protocol = None
@@ -979,6 +1001,15 @@ def main(args):
             elif args.aggregation == 'p2p' and args.topo == 'fedspd':
                 pass  # training + aggregation already handled in run_round above
             
+            elif args.aggregation == 'p2p' and args.topo == 'l2c':
+                node_states = l2c_protocol.aggregate_and_update(
+                    rnd,
+                    node_states,
+                    distributed_val_data,
+                    distributed_val_label,
+                    net_name, inp_dim, out_dim,
+                )
+                
             elif args.aggregation == 'p2p':
                 if args.topo == 'k-regular-random':
                     _, W_local = agg.k_regular_random(
