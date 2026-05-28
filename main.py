@@ -63,6 +63,7 @@ from pagan_v4 import PAGANv4
 
 from fedspd import FedSPD
 from l2c import L2CProtocol
+from federico import FedeRiCoProtocol
 
 
 # -----------------------------------------------------------------------
@@ -81,7 +82,7 @@ def parse_args():
                         choices=['isolated','fedsgd','fedavg','p2p'])
     parser.add_argument("--topo",           type=str,   default=None,
                         choices=['k-regular-random','k-regular-clustered',
-                                 'pagan','dpfl','paganv2','paganv3', 'paganv4', 'fedspd', 'l2c'])
+                                 'pagan','dpfl','paganv2','paganv3', 'paganv4', 'fedspd', 'l2c', 'federico'])
     parser.add_argument("--num_spokes",     type=int,   default=100)
     parser.add_argument("--num_clusters",   type=int,   default=0)
     parser.add_argument("--num_rounds",     type=int,   default=500)
@@ -158,6 +159,11 @@ def parse_args():
                         help="Learning rate for L2C mixing weight logits.")
     parser.add_argument("--l2c_warmup",  type=int,   default=25,
                         help="Rounds of random sampling before topology freeze.")
+    # ── FedeRiCo-specific args ────────────────────────────────────────
+    parser.add_argument("--federico_epsilon", type=float, default=0.3,
+                        help="Exploration probability in ε-greedy sampling.")
+    parser.add_argument("--federico_beta",    type=float, default=0.6,
+                        help="EMA momentum for loss tracking.")
 
     # ── PAGANv4-specific args ──────────────────────────────────────────
     # v4 reuses all v2_* args for EMA, warmup, tau schedule.
@@ -523,6 +529,20 @@ def main(args):
         )
         print(f"[L2C] N={args.num_spokes}  k={args.k}  "
               f"warmup={args.l2c_warmup}  beta={args.l2c_beta}")
+
+    # ── FedeRiCo init ─────────────────────────────────────────────────
+    federico_protocol = None
+    if args.aggregation == 'p2p' and args.topo == 'federico':
+        federico_protocol = FedeRiCoProtocol(
+            N=args.num_spokes,
+            M=args.k,
+            epsilon=args.federico_epsilon,
+            beta=args.federico_beta,
+            device=aggregator_device,
+            seed=args.seed,
+        )
+        print(f"[FedeRiCo] N={args.num_spokes}  M={args.k}  "
+              f"ε={args.federico_epsilon}  β={args.federico_beta}")
 
     # ── PAGANv4 init ──────────────────────────────────────────────────
     pagan_v4_protocol = None
@@ -1012,7 +1032,14 @@ def main(args):
                     distributed_val_label,
                     net_name, inp_dim, out_dim,
                 )
-                
+            elif args.aggregation == 'p2p' and args.topo == 'federico':
+                node_states = federico_protocol.aggregate_and_update(
+                    rnd, node_states,
+                    distributed_train_data, distributed_train_label,
+                    net_name, inp_dim, out_dim, args.lr,
+                )
+    
+
             elif args.aggregation == 'p2p':
                 if args.topo == 'k-regular-random':
                     _, W_local = agg.k_regular_random(
