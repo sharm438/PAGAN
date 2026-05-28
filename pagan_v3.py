@@ -316,13 +316,18 @@ class PAGANv3:
                 self_idx_in_list = all_nodes.index(i)
                 d_emb[self_idx_in_list] = 0.0
 
-            # ── Blended score ────────────────────────────────────────
-            d_blend = a * d_model + (1.0 - a) * d_emb
+            # # ── Blended score ────────────────────────────────────────
+            # d_blend = a * d_model + (1.0 - a) * d_emb
 
-            # ── Softmax for each variant ─────────────────────────────
-            w_blend = self._softmax_weights(d_blend, tau)
-            w_model = self._softmax_weights(d_model, tau)
-            w_emb   = self._softmax_weights(d_emb,   tau)
+            # # ── Softmax for each variant ─────────────────────────────
+            # w_blend = self._softmax_weights(d_blend, tau)
+            # w_model = self._softmax_weights(d_model, tau)
+            # w_emb   = self._softmax_weights(d_emb,   tau)
+            # Output blending — each signal normalizes independently
+            w_model = self._softmax_weights(d_model, 1.0)
+            w_emb   = self._softmax_weights(d_emb,   1.0)  # separate tau
+            w_blend = a * w_model + (1.0 - a) * w_emb
+
 
             for j, (wb, wm, we) in zip(all_nodes, zip(w_blend, w_model, w_emb)):
                 W_blend[i, j] = float(wb)
