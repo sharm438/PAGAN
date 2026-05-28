@@ -89,6 +89,7 @@ class PAGANv3:
                                              # default: total_rounds
                  # Triplet loss weighting scheme
                  triplet_weight_scheme: str = 'flat',   # 'flat' | 'inv_rank' | 'inv_sqrt_rank'
+                 alpha_schedule = 'linear'
                  verbose: bool = True):
 
         # ── Base (identical to v2) ───────────────────────────────────
@@ -133,6 +134,7 @@ class PAGANv3:
         self.last_W_blend = None    # blended weights (= last_W, used for aggregation)
 
         self.soft_metrics_log = []  # list of dicts, one per eval round
+        self.alpha_schedule = alpha_schedule
 
         if verbose:
             print(f"[PAGANv3] init: N={num_nodes}  warmup={warmup_rounds}  "

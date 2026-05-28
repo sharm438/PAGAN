@@ -485,6 +485,7 @@ def main(args):
             alpha_start          = args.v3_alpha_start,
             alpha_end            = args.v3_alpha_end,
             triplet_weight_scheme= args.v3_triplet_scheme,
+            alpha_schedule = args.alpha_schedule,
         )
         # metrics['v3_soft_metrics'] = []
         # metrics['v3_emb_stats']    = []
