@@ -150,7 +150,18 @@ class PAGANv3:
         if rnd >= self.alpha_end:
             return 0.0
         progress = (rnd - self.alpha_start) / (self.alpha_end - self.alpha_start)
-        return float(1.0 - progress)   # linear decay
+        if self.alpha_schedule == 'linear':
+            return 1.0 - progress
+        elif self.alpha_schedule == 'cosine':
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        elif self.alpha_schedule == 'concave':
+            return (1.0 - progress) ** 2
+        elif self.alpha_schedule == 'convex':
+            return 1.0 - progress ** 2
+        elif self.alpha_schedule == 'floor':
+            return max(0.3, 1.0 - progress)
+        else:
+            return 1.0 - progress   # fallback to linear
 
     # ------------------------------------------------------------------
     # Temperature schedule (identical to v2)

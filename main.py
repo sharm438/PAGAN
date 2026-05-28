@@ -140,6 +140,9 @@ def parse_args():
                         help="Triplet loss rank-weighting scheme. "
                              "'flat'=v2 baseline, 'inv_rank'=1/(r+1), "
                              "'inv_sqrt_rank'=1/sqrt(r+1).")
+    parser.add_argument("--v3_alpha_schedule", type=str, default='linear',
+                    choices=['linear','cosine','concave','convex','floor'])
+
 
 
     # ── FedSPD-specific args ──────────────────────────────────────────
