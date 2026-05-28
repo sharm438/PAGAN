@@ -89,7 +89,7 @@ class PAGANv3:
                                              # default: total_rounds
                  # Triplet loss weighting scheme
                  triplet_weight_scheme: str = 'flat',   # 'flat' | 'inv_rank' | 'inv_sqrt_rank'
-                 alpha_schedule = 'linear'
+                 alpha_schedule = 'linear',
                  verbose: bool = True):
 
         # ── Base (identical to v2) ───────────────────────────────────
