@@ -60,6 +60,7 @@ from pagan_v2 import PAGANv2
 # PAGANv3
 from pagan_v3 import PAGANv3
 from pagan_v4 import PAGANv4
+from pagan_v1 import PAGANv1
 
 from fedspd import FedSPD
 from l2c import L2CProtocol
@@ -82,7 +83,7 @@ def parse_args():
                         choices=['isolated','fedsgd','fedavg','p2p'])
     parser.add_argument("--topo",           type=str,   default=None,
                         choices=['k-regular-random','k-regular-clustered',
-                                 'pagan','dpfl','paganv2','paganv3', 'paganv4', 'fedspd', 'l2c', 'federico'])
+                                 'pagan','dpfl','paganv2','paganv3', 'paganv4', 'paganv1', 'fedspd', 'l2c', 'federico'])
     parser.add_argument("--num_spokes",     type=int,   default=100)
     parser.add_argument("--num_clusters",   type=int,   default=0)
     parser.add_argument("--num_rounds",     type=int,   default=500)
@@ -144,6 +145,29 @@ def parse_args():
     parser.add_argument("--v3_alpha_schedule", type=str, default='linear',
                     choices=['linear','cosine','concave','convex','floor'])
 
+    # ── PAGANv1-specific args ─────────────────────────────────────────
+    # Reuses: --v2_warmup_rounds, --v2_tau_*, --v2_emb_lr*, --v2_emb_steps
+    # New:
+    parser.add_argument("--v1_alpha_fresh",    type=float, default=0.1,
+                        help="Tent weight decay toward W (warmup side). "
+                             "Higher → earlier rounds discounted more.")
+    parser.add_argument("--v1_beta_fresh",     type=float, default=0.1,
+                        help="Tent weight decay away from W (post-warmup). "
+                             "Higher → post-warmup observations fade faster.")
+    parser.add_argument("--v1_count_thresh",   type=int,   default=3,
+                        help="Observation count for full warmup confidence.")
+    parser.add_argument("--v1_confirm_start",  type=int,   default=None,
+                        help="Round to switch from random to confirmation "
+                             "sampling. Default: warmup_rounds - 5.")
+    parser.add_argument("--v1_vouch_M",        type=int,   default=5,
+                        help="Top-M of j's neighbours checked for vouching.")
+    parser.add_argument("--v1_low_conf",       type=float, default=0.4,
+                        help="Confidence below this → pair needs vouching.")
+    parser.add_argument("--v1_vouch_thresh",   type=float, default=0.3,
+                        help="Vouch score needed to lift eff_conf.")
+    parser.add_argument("--v1_triplet_scheme", type=str,   default='flat',
+                        choices=['flat', 'inv_rank', 'inv_sqrt_rank'],
+                        help="Triplet loss rank-weighting scheme.")
 
 
     # ── FedSPD-specific args ──────────────────────────────────────────
@@ -490,7 +514,46 @@ def main(args):
         # metrics['v3_soft_metrics'] = []
         # metrics['v3_emb_stats']    = []
 
-    
+    # ── PAGANv1 init ──────────────────────────────────────────────────
+    pagan_v1_protocol = None
+    if args.aggregation == 'p2p' and args.topo == 'paganv1':
+        N = args.num_spokes
+        g = torch.Generator(device=aggregator_device)
+        g.manual_seed(args.seed if args.seed and args.seed > 0 else 123456789)
+        E_list = agg.init_identical_E_list(N, args.embed_dim,
+                                           aggregator_device, g)
+        embedding_opts = []
+        embedding_schedulers = []
+        for i in range(N):
+            opt = torch.optim.SGD([E_list[i]], lr=args.v2_emb_lr,
+                                   momentum=0.9, weight_decay=1e-4)
+            embedding_opts.append(opt)
+            embedding_schedulers.append(
+                torch.optim.lr_scheduler.ExponentialLR(opt, gamma=0.99))
+ 
+        pagan_v1_protocol = PAGANv1(
+            num_nodes            = N,
+            device               = aggregator_device,
+            total_rounds         = args.num_rounds,
+            warmup_rounds        = args.v2_warmup_rounds,
+            tau_0                = args.v2_tau_0,
+            tau_min              = args.v2_tau_min,
+            tau_half_life        = args.v2_tau_half_life,
+            softmax_tau          = args.v2_softmax_tau,
+            alpha_fresh          = args.v1_alpha_fresh,
+            beta_fresh           = args.v1_beta_fresh,
+            count_threshold      = args.v1_count_thresh,
+            confirm_start        = args.v1_confirm_start,
+            vouch_M              = args.v1_vouch_M,
+            low_conf_threshold   = args.v1_low_conf,
+            vouch_threshold      = args.v1_vouch_thresh,
+            triplet_weight_scheme= args.v1_triplet_scheme,
+            node_to_cluster      = node_to_cluster,
+            eff_weight_thresh    = args.v2_eff_thresh,
+            debug_node           = 0,
+        )
+        
+
     global_wts  = utils.model_to_vec(global_model)
     # ── FedSPD init ─────────
     fedspd_protocol = None
@@ -628,7 +691,10 @@ def main(args):
         'v4_soft_metrics': [],
         'v4_emb_stats': [],
         'v4_trust_snapshots': [],
+        'v1_soft_metrics': [],
+        'v1_emb_stats': []
     }
+
     if args.local_test_frac > 0:
         metrics['local_split_stats'] = split_distribution_stats
     if args.num_clusters > 0:
@@ -1006,6 +1072,85 @@ def main(args):
                 prev_ranked_neighbors = ranked_neighbors
                 prev_ranked_dists     = ranked_dists
 
+            # ================================================================
+            # PAGANv1 — warmup-anchored global affinity
+            # ================================================================
+            elif args.aggregation == 'p2p' and args.topo == 'paganv1':
+                with torch.no_grad():
+                    # 1. Sampling (uniform random warmup / confirmation / post-warmup slots)
+                    neigh_lists = []
+                    for i in range(args.num_spokes):
+                        phys_list = (prev_ranked_neighbors[i].tolist()
+                                     if prev_ranked_neighbors is not None else [])
+                        targets_i = pagan_v1_protocol.get_sampling_targets(
+                            rnd, i, args.k, phys_list, E_list[i])
+                        neigh_lists.append(torch.tensor(
+                            targets_i, device=aggregator_device,
+                            dtype=torch.long))
+ 
+                    # 2. Physical distance ranking
+                    ranked_neighbors, ranked_dists = \
+                        agg.rank_neighbors_by_model_distance(
+                            node_states, neigh_lists)
+ 
+                    # 3. Record: tent distance update + warmup finalisation
+                    #    + W_base refresh (post-warmup)
+                    pagan_v1_protocol.record(
+                        rnd, ranked_neighbors, ranked_dists, E_list=E_list)
+ 
+                    # 4. Aggregation (warmup: isolation; post-warmup: W_base slice)
+                    new_states = pagan_v1_protocol.run_topology_and_aggregate(
+                        rnd, node_states, E_list, ranked_neighbors,
+                        prev_ranked_neighbors)
+                    node_states.copy_(new_states)
+ 
+                # 5. Embedding update (triplet loss, rank-weighted)
+                emb_frozen = (args.v2_freeze_embeddings
+                              and rnd >= args.v2_warmup_rounds)
+                if not emb_frozen and prev_ranked_neighbors is not None:
+                    selection = [
+                        torch.cat([ranked_neighbors[i],
+                                   torch.tensor([i], device=aggregator_device,
+                                                dtype=torch.long)])
+                        for i in range(args.num_spokes)
+                    ]
+                    evidence = agg.gather_neighbor_ranklists_with_dists(
+                        prev_ranked_neighbors, prev_ranked_dists,
+                        chosen_neighbors=selection)
+ 
+                    evidence_weights = pagan_v1_protocol.get_evidence_weights(
+                        evidence)
+ 
+                    steps = (args.v2_emb_steps
+                             if rnd < args.v2_warmup_rounds
+                             else max(1, args.v2_emb_steps // 2))
+ 
+                    if rnd == args.v2_warmup_rounds and not args.v2_freeze_embeddings:
+                        embedding_schedulers = []
+                        for opt in embedding_opts:
+                            for pg in opt.param_groups:
+                                pg['lr'] = args.v2_emb_lr_post
+                            embedding_schedulers.append(
+                                torch.optim.lr_scheduler.ExponentialLR(
+                                    opt, gamma=0.99))
+                        print(f"[v1] Embedding lr -> {args.v2_emb_lr_post}")
+ 
+                    agg.update_embeddings_ladder_triplet(
+                        E_list, evidence,
+                        opt_list=embedding_opts,
+                        steps=steps,
+                        trust_weights=evidence_weights)
+                    for sch in embedding_schedulers:
+                        sch.step()
+ 
+                # 6. Embedding monitoring every 5 rounds during warmup
+                if rnd < args.v2_warmup_rounds and rnd % 5 == 0:
+                    entry = pagan_v1_protocol.monitor_embeddings(
+                        rnd, E_list, node_to_cluster)
+                    metrics['v1_emb_stats'].append(entry)
+ 
+                prev_ranked_neighbors = ranked_neighbors
+                prev_ranked_dists     = ranked_dists
 
             # ── k-regular and DPFL paths (unchanged from main_0305) ───
             elif args.aggregation == 'p2p' and args.topo == 'dpfl':
@@ -1120,6 +1265,25 @@ def main(args):
                           f"self_w={sm.get('avg_self_weight',0):.3f}  "
                           f"trust_mean={sm.get('trust_mean',0):.3f}")
 
+                if args.topo == 'paganv1' and rnd >= args.v2_warmup_rounds:
+                    sm = pagan_v1_protocol.compute_soft_metrics(rnd)
+                    metrics['v1_soft_metrics'].append(sm)
+                    print(f"  [v1 soft rnd {rnd:3d}] "
+                          f"tp={sm.get('tp',0)}  fp={sm.get('fp',0)}  "
+                          f"fn={sm.get('fn',0)}  "
+                          f"self_w={sm.get('avg_self_weight',0):.3f}  "
+                          f"scouts={sm.get('scout_count',0)}")
+ 
+                if args.topo == 'paganv1':
+                    emb_stats = compute_emb_stats(
+                        E_list, node_to_cluster, jsd_matrix)
+                    emb_stats['round'] = rnd
+                    metrics['v1_emb_stats'].append(emb_stats)
+                    print(f"  [v1 emb rnd {rnd:3d}] "
+                          f"tp@5={emb_stats['tp_at_5']:.3f}  "
+                          f"tp@10={emb_stats['tp_at_10']:.3f}  "
+                          f"tp@15={emb_stats['tp_at_15']:.3f}")
+
                 # Parallel eval
                 if args.num_workers > 0 and worker_pool is not None:
                     weights_cpu = [w.detach().cpu() for w in node_states]
@@ -1181,6 +1345,23 @@ def main(args):
             warmup_count   = pagan_v4_protocol.warmup_count,
             conflict_mask  = pagan_v4_protocol.conflict_mask)
         print(f"[PAGANv4] Saved trust state -> {filename}_v4_trust.npz")
+
+    if args.topo == 'paganv1':
+        pagan_v1_protocol.registry.save(filename + '_shadow')
+        if pagan_v1_protocol.soft_metrics_log:
+            metrics['v1_soft_metrics'] = pagan_v1_protocol.soft_metrics_log
+        summary = pagan_v1_protocol.get_summary()
+        metrics['v1_summary'] = summary
+        print(f"[PAGANv1] plateau_round={summary['plateau_round']}  "
+              f"total_scouts={summary['scout_count']}")
+        np.savez_compressed(
+            filename + '_v1_state',
+            d_tent     = pagan_v1_protocol.d_tent,
+            confidence = pagan_v1_protocol.confidence,
+            eff_conf   = pagan_v1_protocol.eff_conf,
+            W_base     = pagan_v1_protocol.W_base,
+            score      = pagan_v1_protocol.score)
+        print(f"[PAGANv1] Saved state -> {filename}_v1_state.npz")
 
     # ── Save metrics ──────────────────────────────────────────────────
     if metrics.get('local_split_stats'):
