@@ -148,16 +148,19 @@ class ShadowRegistry:
                  end_round: int = None, window: int = 10) -> float:
         end   = (self.R - 1) if end_round is None else min(end_round, self.R - 1)
         start = max(0, end - window + 1)
-        sw    = self.shadow_sw[observer, target, start:end + 1]
+        sw    = self.shadow_dist[observer, target, start:end + 1]
         valid = sw[~np.isnan(sw)]
         return float(np.mean(valid)) if len(valid) > 0 else np.nan
 
     def affinity_vector(self, observer: int,
                         end_round: int = None, window: int = 10) -> np.ndarray:
-        return np.array([
-            self.affinity(observer, j, end_round, window)
-            for j in range(self.N)
-        ], dtype=np.float32)
+        end   = (self.R - 1) if end_round is None else min(end_round, self.R - 1)
+        start = max(0, end - window + 1)
+        dists = self.shadow_dist[observer, :, start:end + 1]   # [N, W]
+        with np.errstate(invalid='ignore', divide='ignore'):
+            aff = np.nanmean(1.0 / (1.0 + dists), axis=1)     # [N]
+        return aff.astype(np.float32)
+
 
     # ------------------------------------------------------------------
     # Embedding evaluation (unchanged)
@@ -200,12 +203,12 @@ class ShadowRegistry:
     # ------------------------------------------------------------------
     # Simple accessors
     # ------------------------------------------------------------------
-    def rank_history(self, observer, target): return self.shadow_rank[observer, target, :]
+    def rank_history(self, observer, target): raise AttributeError("shadow_rank removed — use dist_history() instead.")
     def dist_history(self, observer, target): return self.shadow_dist[observer, target, :]
-    def sw_history(self, observer, target):   return self.shadow_sw[observer, target, :]
+    def sw_history(self, observer, target):   raise AttributeError("shadow_sw removed — use affinity() instead.")
     def spread_history(self, observer):       return self.dist_spread[observer, :]
     def appearance_count(self, observer, target):
-        return int(np.sum(~np.isnan(self.shadow_rank[observer, target, :])))
+        return int(np.sum(~np.isnan(self.shadow_dist[observer, target, :])))
 
     # ------------------------------------------------------------------
     def save(self, path: str):
@@ -225,13 +228,13 @@ class ShadowRegistry:
     def load(cls, path: str) -> 'ShadowRegistry':
         p   = path if path.endswith('.npz') else path + '.npz'
         d   = np.load(p)
-        N, _, R = d['shadow_rank'].shape
+        N, _, R = d['shadow_dist'].shape
         reg = cls.__new__(cls)
         reg.N           = N
         reg.R           = R
         reg.lam         = float(d['ema_lambda'][0]) if 'ema_lambda' in d else 0.95
         reg.tau         = float(d['tau'][0])        if 'tau'        in d else 1.0
-        reg.shadow_rank = d['shadow_rank']
+        #reg.shadow_rank = d['shadow_rank']
         reg.shadow_dist = d['shadow_dist']
         reg.shadow_sw   = d['shadow_sw']   if 'shadow_sw' in d else \
                           np.full((N, N, R), np.nan, dtype=np.float32)

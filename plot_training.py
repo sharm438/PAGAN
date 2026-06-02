@@ -70,7 +70,7 @@ class TrainingPlotter:
 
         ntc = self.metrics.get("node_to_cluster", [])
         self.node_to_cluster = np.array(ntc) if ntc else None
-        self.soft_metrics    = self.metrics.get("v2_soft_metrics", [])
+        self.soft_metrics    = (self.metrics.get("v1_soft_metrics", None) or self.metrics.get("v2_soft_metrics", []))
         self.exp_name        = os.path.basename(metrics_path).replace("_metrics.json","")
 
         os.makedirs("outputs", exist_ok=True)
@@ -378,7 +378,7 @@ class TrainingPlotter:
             tp = TrainingPlotter("outputs/live_emb_25_25_patho1_metrics.json")
             tp.embedding_precision()
         """
-        emb_stats = self.metrics.get('v2_emb_stats', [])
+        emb_stats = (self.metrics.get('v1_emb_stats', None) or self.metrics.get('v2_emb_stats', []))
         if not emb_stats:
             print("[embedding_precision] No v2_emb_stats found in metrics.")
             return
@@ -400,7 +400,8 @@ class TrainingPlotter:
         # Mark warmup boundary if soft_metrics exist (first entry = warmup end)
         if self.soft_metrics:
             #warmup_end = self.soft_metrics[0]['round']
-            warmup_end = self.metrics.get('v2_warmup_rounds', None)
+            warmup_end = (self.metrics.get('v2_warmup_rounds', None)
+                          or self.metrics.get('v1_warmup_rounds', None))
             if warmup_end == None:
                 warmup_end = self.soft_metrics[0]['round']
             ax.axvline(x=warmup_end, color='black', lw=1.2, ls='--', alpha=0.5,
