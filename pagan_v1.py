@@ -150,6 +150,7 @@ class PAGANv1:
         self.obs_wsum  = np.zeros((num_nodes, num_nodes), dtype=np.float64)
         self.obs_wgt   = np.zeros((num_nodes, num_nodes), dtype=np.float64)
         self.obs_count = np.zeros((num_nodes, num_nodes), dtype=np.int32)
+        self.obs_count_warmup = np.zeros((num_nodes, num_nodes), dtype=np.int32)
         np.fill_diagonal(self.obs_wgt, 1.0)   # self always has weight
 
         # ── Warmup anchors (computed at round W, then frozen) ──────────
@@ -167,6 +168,12 @@ class PAGANv1:
         # warmup_rank_dict[i]  : {j: rank}  O(1) lookup
         self.warmup_rank_order: list = [[] for _ in range(num_nodes)]
         self.warmup_rank_dict:  list = [{} for _ in range(num_nodes)]
+
+        self.warmup_top_Q_sets: list = [set() for _ in range(num_nodes)]
+        self.warmup_top_Q: int = max(5, round(num_nodes * 0.15))  # top 15% of N
+
+        self.last_seen = np.full((num_nodes, num_nodes), -1, dtype=np.int32)
+        np.fill_diagonal(self.last_seen, 0)
 
         # ── Embedding distance scale (calibrated at warmup end) ────────
         self.emb_scale = 1.0   # scalar: scaled D_emb ≈ d_tent scale
@@ -260,9 +267,13 @@ class PAGANv1:
                 self.obs_wsum[i, j]  += w_tent * d
                 self.obs_wgt[i, j]   += w_tent
                 self.obs_count[i, j] += 1
+                self.last_seen[i, j]  = rnd    
+                if rnd < self.warmup_rounds:
+                    self.obs_count_warmup[i, j] += 1
+
 
         # Finalise warmup on first post-warmup round
-        if rnd == self.warmup_rounds and not self._warmup_finalised:
+        if rnd == self.warmup_rounds - 1 and not self._warmup_finalised:
             if E_list is not None:
                 self._finalize_warmup(E_list)
             else:
@@ -271,7 +282,7 @@ class PAGANv1:
                 self._finalize_warmup(None)
 
         # Post-warmup: refresh W_base with current embeddings each round
-        if rnd > self.warmup_rounds and self._warmup_finalised and E_list is not None:
+        if rnd >= self.warmup_rounds and self._warmup_finalised and E_list is not None:
             self._update_W_base(E_list, rnd)
 
     # ------------------------------------------------------------------
@@ -291,7 +302,7 @@ class PAGANv1:
         self.d_tent = d_raw
 
         # ── Confidence ────────────────────────────────────────────────
-        conf = np.clip(self.obs_count / max(self.count_threshold, 1),
+        conf = np.clip(self.obs_count_warmup / max(self.count_threshold, 1),
                        0.0, 1.0).astype(np.float32)
         np.fill_diagonal(conf, 1.0)
         self.confidence = conf
@@ -304,6 +315,16 @@ class PAGANv1:
             order = np.argsort(row).tolist()
             self.warmup_rank_order[i] = order
             self.warmup_rank_dict[i]  = {int(j): r for r, j in enumerate(order)}
+
+        # Top-Q set for middle-ground vouching
+        # A valid voucher must be in i's warmup top-Q AND currently close
+        Q = self.warmup_top_Q
+        for i in range(N):
+            self.warmup_top_Q_sets[i] = {
+                int(self.warmup_rank_order[i][r])
+                for r in range(min(Q, len(self.warmup_rank_order[i])))
+                if np.isfinite(self.d_tent[i, self.warmup_rank_order[i][r]])
+            }
 
         # ── Embedding scale calibration ───────────────────────────────
         if E_list is not None:
@@ -361,6 +382,12 @@ class PAGANv1:
         W_base[i,:] = softmax(-score[i,:] / τ)   over all N nodes
         Self gets score=0 → always highest logit → self_w autoscales with τ.
         """
+        with np.errstate(invalid='ignore', divide='ignore'):
+            d_tent_live = np.where(self.obs_wgt > 0,
+                                self.obs_wsum / self.obs_wgt,
+                                np.inf).astype(np.float32)
+        np.fill_diagonal(d_tent_live, 0.0)
+        
         N   = self.N
         tau = self.tau(rnd)
 
@@ -373,8 +400,8 @@ class PAGANv1:
 
         # Blend: high conf → use d_tent; low conf → use embedding
         ec         = self.eff_conf
-        d_tent_safe = np.where(np.isfinite(self.d_tent),
-                               self.d_tent, D_emb_scaled)
+        d_tent_safe = np.where(np.isfinite(d_tent_live),
+                               d_tent_live, D_emb_scaled)
         self.score = (ec * d_tent_safe
                       + (1.0 - ec) * D_emb_scaled).astype(np.float32)
         np.fill_diagonal(self.score, 0.0)
@@ -391,30 +418,47 @@ class PAGANv1:
     # ------------------------------------------------------------------
     # Vouching — quality × coverage formula
     # ------------------------------------------------------------------
-    def _vouch_score(self, i: int, j: int, j_ranked_nbrs) -> float:
+    def _vouch_score(self, i: int, j: int, j_ranked_nbrs,
+                    current_ranked_i=None) -> float:
         """
-        For pair (i,j): look at j's top-M neighbours.
-        quality  = 1 - mean_warmup_rank(seen neighbours) / (N-1)
-        coverage = fraction of j's top-M that i has warmup data for
-        vouch    = quality × coverage
-        Unseen nodes are excluded from mean (not penalised in quality);
-        they reduce coverage instead.
+        Vouch score = quality × coverage.
+        Valid voucher m must satisfy ALL of:
+        1. i observed m during warmup
+        2. m was in i's warmup top-Q (genuine warmup friend)
+        3. m is currently in i's ranked list (still close now)
+        Condition 3 prevents contamination chains via drifted nodes.
+        Unseen nodes excluded from quality mean, reduce coverage instead.
         """
         if j_ranked_nbrs is None or j_ranked_nbrs.numel() == 0:
             return 0.0
 
         j_topM    = j_ranked_nbrs[:self.vouch_M].cpu().tolist()
         rank_dict = self.warmup_rank_dict[i]
+        top_Q     = self.warmup_top_Q_sets[i]
         N         = self.N
 
-        seen = [(m, rank_dict[m]) for m in j_topM if m in rank_dict]
+        # Build current set for condition 3
+        current_set = set()
+        if current_ranked_i is not None:
+            current_set = set(current_ranked_i.cpu().tolist())
+
+        # Apply all three conditions
+        if current_ranked_i is not None:
+            seen = [(m, rank_dict[m]) for m in j_topM
+                    if m in rank_dict       # cond 1: seen in warmup
+                    and m in top_Q          # cond 2: was warmup friend
+                    and m in current_set]   # cond 3: still close now
+        else:
+            # Fallback: conditions 1+2 only (no current neighbours available)
+            seen = [(m, rank_dict[m]) for m in j_topM
+                    if m in rank_dict and m in top_Q]
+
         if not seen:
             return 0.0
 
         mean_rank = float(np.mean([r for _, r in seen]))
         quality   = 1.0 - mean_rank / max(N - 1, 1)
         coverage  = len(seen) / max(len(j_topM), 1)
-
         return float(np.clip(quality * coverage, 0.0, 1.0))
 
     # ------------------------------------------------------------------
@@ -436,8 +480,9 @@ class PAGANv1:
                 if self.confidence[i, j] >= self.low_conf_threshold:
                     continue   # high warmup confidence — no vouching needed
 
-                v = self._vouch_score(i, j, ranked_neighbors[j])
+                v = self._vouch_score(i, j, ranked_neighbors[j], current_ranked_i=ranked_neighbors[i])
                 new_eff = max(float(self.confidence[i, j]), v)
+                #new_eff = max(float(self.eff_conf[i, j]), v)
 
                 # Scout event: low warmup confidence, passes vouching
                 if (v >= self.vouch_threshold
@@ -604,6 +649,7 @@ class PAGANv1:
         self._update_vouching(rnd, ranked_neighbors)
 
         # Build W matrix from W_base: slice sampled + self, renormalise
+        tau = self.tau(rnd)
         N, _ = node_states.shape
         W    = torch.zeros(N, N, device=self.device, dtype=node_states.dtype)
 
@@ -611,17 +657,20 @@ class PAGANv1:
             sampled   = ranked_neighbors[i].cpu().tolist()
             all_nodes = sampled + [i]
 
-            # Slice W_base and renormalise over this subset
-            wb     = np.array([self.W_base[i, j] for j in all_nodes],
-                               dtype=np.float32)
-            wb_sum = wb.sum()
-            if wb_sum > 1e-12:
-                wb = wb / wb_sum
-            else:
-                wb = np.ones(len(all_nodes), dtype=np.float32) / len(all_nodes)
+            d_vec = np.array([
+                0.0 if j == i else
+                (float(self.score[i, j]) if np.isfinite(self.score[i, j]) else 999.0)
+                for j in all_nodes
+            ], dtype=np.float32)
 
-            for j, w in zip(all_nodes, wb):
+            logits  = -d_vec / max(tau, 1e-8)
+            logits -= logits.max()
+            exp_w   = np.exp(logits)
+            w_np    = exp_w / (exp_w.sum() + 1e-12)
+
+            for j, w in zip(all_nodes, w_np):
                 W[i, j] = float(w)
+
 
         self.last_W = W.detach()
 
@@ -763,6 +812,7 @@ class PAGANv1:
             avg_self_weight=avg_self,
             tau=self.tau(rnd),
             scout_count=self.scout_count,
+            eff_conf_vouched = int((self.eff_conf[~np.eye(self.N, dtype=bool)] >= self.vouch_threshold).sum())
         )
         self.soft_metrics_log.append(result)
         return result
@@ -777,4 +827,62 @@ class PAGANv1:
             'scout_count':   self.scout_count,
             'emb_quality':   self.emb_quality_log,
             'scout_events':  self.scout_events[:100],  # first 100
+        }
+
+    def compute_scouts(self, min_lift: float = 0.1) -> dict:
+        """
+        Reports:
+        warmup_confirmed : true-friend pairs with warmup_conf >= low_conf_threshold
+        post_discovered  : true-friend pairs with low warmup_conf but
+                            meaningfully lifted by vouching (lift > min_lift)
+        missed           : true-friend pairs with low warmup_conf and no discovery
+        Only counts unique directed pairs. No recounting.
+        """
+        N   = self.N
+        ntc = self.node_to_cluster
+
+        warmup_confirmed = []
+        post_discovered  = []
+        missed           = []
+        non_friend_lifted = []   # lifted but not a true friend — interesting to log
+
+        for i in range(N):
+            for j in range(N):
+                if i == j:
+                    continue
+                wc  = float(self.confidence[i, j])
+                ec  = float(self.eff_conf[i, j])
+                lift = ec - wc
+                is_friend = (ntc is not None
+                            and ntc[i] == ntc[j])
+
+                if is_friend:
+                    if wc >= self.low_conf_threshold:
+                        warmup_confirmed.append({'node_i': i, 'node_j': j,
+                                                'warmup_conf': wc})
+                    elif lift > min_lift:
+                        post_discovered.append({'node_i': i, 'node_j': j,
+                                                'warmup_conf': wc,
+                                                'final_eff_conf': ec,
+                                                'lift': lift})
+                    else:
+                        missed.append({'node_i': i, 'node_j': j,
+                                    'warmup_conf': wc,
+                                    'final_eff_conf': ec})
+                else:
+                    # Non-friend that was vouched — potential false positive
+                    if lift > min_lift:
+                        non_friend_lifted.append({'node_i': i, 'node_j': j,
+                                                'warmup_conf': wc,
+                                                'final_eff_conf': ec,
+                                                'lift': lift})
+
+        return {
+            'warmup_confirmed_count':  len(warmup_confirmed),
+            'post_discovered_count':   len(post_discovered),
+            'missed_count':            len(missed),
+            'non_friend_lifted_count': len(non_friend_lifted),
+            'post_discovered':         post_discovered[:50],
+            'missed':                  missed[:50],
+            'non_friend_lifted':       non_friend_lifted[:20],
         }

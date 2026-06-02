@@ -40,13 +40,13 @@ class ShadowRegistry:
         self.tau        = softmax_tau          # used for diagnostic shadow_sw only
 
         # Primary diagnostic stores  [N, N, R]
-        self.shadow_rank = np.full((num_nodes, num_nodes, num_rounds),
-                                    np.nan, dtype=np.float32)
+        # self.shadow_rank = np.full((num_nodes, num_nodes, num_rounds),
+        #                             np.nan, dtype=np.float32)
         self.shadow_dist = np.full((num_nodes, num_nodes, num_rounds),
                                     np.nan, dtype=np.float32)
         # Diagnostic softmax weights (not used in aggregation)
-        self.shadow_sw   = np.full((num_nodes, num_nodes, num_rounds),
-                                    np.nan, dtype=np.float32)
+        # self.shadow_sw   = np.full((num_nodes, num_nodes, num_rounds),
+        #                             np.nan, dtype=np.float32)
         self.dist_spread = np.full((num_nodes, num_rounds),
                                     np.nan, dtype=np.float32)
 
@@ -84,8 +84,12 @@ class ShadowRegistry:
                 dsts.cpu().numpy().astype(np.float32), 0.0))
 
             # ── rank and raw distance (diagnostic) ────────────────────
-            for rank_pos, (j, d) in enumerate(zip(nbrs_np, l2_np)):
-                self.shadow_rank[i, j, rnd] = float(rank_pos)
+            # for rank_pos, (j, d) in enumerate(zip(nbrs_np, l2_np)):
+            #     self.shadow_rank[i, j, rnd] = float(rank_pos)
+            #     self.shadow_dist[i, j, rnd] = d
+
+            # Raw distances only — rank and sw reconstructable in post-processing
+            for j, d in zip(nbrs_np, l2_np):
                 self.shadow_dist[i, j, rnd] = d
 
             # ── EMA distance update (per-pair lambda if provided) ─────
@@ -97,15 +101,15 @@ class ShadowRegistry:
                     self.ema_dist[i, j] = (lam_ij * self.ema_dist[i, j]
                                            + (1.0 - lam_ij) * d)
 
-            # ── Diagnostic softmax weights (includes self at d=0) ──────
-            all_ids = np.append(nbrs_np, i)
-            all_l2  = np.append(l2_np,  0.0)
-            logits  = -all_l2 / max(self.tau, 1e-8)
-            logits -= logits.max()
-            exp_w   = np.exp(logits)
-            sw      = exp_w / (exp_w.sum() + 1e-12)
-            for j, w in zip(all_ids, sw):
-                self.shadow_sw[i, j, rnd] = float(w)
+            # # ── Diagnostic softmax weights (includes self at d=0) ──────
+            # all_ids = np.append(nbrs_np, i)
+            # all_l2  = np.append(l2_np,  0.0)
+            # logits  = -all_l2 / max(self.tau, 1e-8)
+            # logits -= logits.max()
+            # exp_w   = np.exp(logits)
+            # sw      = exp_w / (exp_w.sum() + 1e-12)
+            # for j, w in zip(all_ids, sw):
+            #     self.shadow_sw[i, j, rnd] = float(w)
 
             # ── Distance spread (diagnostic) ───────────────────────────
             if len(l2_np) >= 2:
@@ -207,9 +211,9 @@ class ShadowRegistry:
     def save(self, path: str):
         np.savez_compressed(
             path,
-            shadow_rank = self.shadow_rank,
+            #shadow_rank = self.shadow_rank,
             shadow_dist = self.shadow_dist,
-            shadow_sw   = self.shadow_sw,
+            #shadow_sw   = self.shadow_sw,
             dist_spread = self.dist_spread,
             ema_dist    = self.ema_dist,
             ema_lambda  = np.array([self.lam],  dtype=np.float32),

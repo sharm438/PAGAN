@@ -1348,19 +1348,43 @@ def main(args):
 
     if args.topo == 'paganv1':
         pagan_v1_protocol.registry.save(filename + '_shadow')
+
+        # Post-hoc scout computation (unique pairs, not events)
+        scouts = pagan_v1_protocol.compute_scouts()
+        metrics['v1_scouts'] = {
+            'warmup_confirmed':      scouts['warmup_confirmed_count'],
+            'post_discovered':       scouts['post_discovered_count'],
+            'missed':                scouts['missed_count'],
+            'non_friend_lifted':     scouts['non_friend_lifted_count'],
+            'post_discovered_pairs': scouts['post_discovered'][:50],
+            'missed_pairs':          scouts['missed'][:50],
+            'non_friend_lifted_pairs': scouts['non_friend_lifted'][:20],
+        }
+
+        print(f"[PAGANv1] true-friend pairs — "
+            f"warmup_confirmed={scouts['warmup_confirmed_count']}  "
+            f"post_discovered={scouts['post_discovered_count']}  "
+            f"missed={scouts['missed_count']}")
+        print(f"  non-friend lifted (watch for false positives): "
+            f"{scouts['non_friend_lifted_count']}")
+
+
         if pagan_v1_protocol.soft_metrics_log:
             metrics['v1_soft_metrics'] = pagan_v1_protocol.soft_metrics_log
         summary = pagan_v1_protocol.get_summary()
         metrics['v1_summary'] = summary
-        print(f"[PAGANv1] plateau_round={summary['plateau_round']}  "
-              f"total_scouts={summary['scout_count']}")
+        metrics['v1_summary']['warmup_confirmed'] = scouts['warmup_confirmed_count']
+        metrics['v1_summary']['post_discovered']  = scouts['post_discovered_count']
+        metrics['v1_summary']['missed']           = scouts['missed_count']
+
         np.savez_compressed(
             filename + '_v1_state',
             d_tent     = pagan_v1_protocol.d_tent,
             confidence = pagan_v1_protocol.confidence,
             eff_conf   = pagan_v1_protocol.eff_conf,
             W_base     = pagan_v1_protocol.W_base,
-            score      = pagan_v1_protocol.score)
+            score      = pagan_v1_protocol.score,
+            last_seen = pagan_v1_protocol.last_seen)
         print(f"[PAGANv1] Saved state -> {filename}_v1_state.npz")
 
     # ── Save metrics ──────────────────────────────────────────────────
