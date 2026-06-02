@@ -663,14 +663,14 @@ class PAGANv1:
         remaining = k_total
  
         # Slot A: warmup friends — quality not quantity
-        k_a = max(2, min(self.cap_slot_a,
+        k_a = 0 if self.frac_slot_a == 0.0 else max(2, min(self.cap_slot_a,
                          round(self.frac_slot_a * k_total)))
         k_a = min(k_a, remaining - 3)   # leave room for B + D
         k_a = max(k_a, 0)
         remaining -= k_a
  
         # Slot B: embedding discovery
-        k_b = max(2, min(self.cap_slot_b,
+        k_b = 0 if self.frac_slot_b == 0.0 else max(2, min(self.cap_slot_b,
                          round(self.frac_slot_b * k_total)))
         k_b = min(k_b, remaining - 2)   # leave room for D
         k_b = max(k_b, 0)
@@ -678,7 +678,7 @@ class PAGANv1:
  
         # Slot C: low-confidence targeted exploration
         # Bounded by actual number of low-conf pairs that exist
-        k_c = max(0, min(self.cap_slot_c,
+        k_c = 0 if self.frac_slot_c == 0.0 else max(0, min(self.cap_slot_c,
                          round(self.frac_slot_c * k_total),
                          n_low_conf,
                          remaining - 1))   # leave room for D
