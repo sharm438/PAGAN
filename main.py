@@ -168,7 +168,21 @@ def parse_args():
     parser.add_argument("--v1_triplet_scheme", type=str,   default='flat',
                         choices=['flat', 'inv_rank', 'inv_sqrt_rank'],
                         help="Triplet loss rank-weighting scheme.")
-
+    parser.add_argument("--v1_frac_slot_a",   type=float, default=0.30,
+                        help="Fraction of k for slot A (warmup friends). "
+                             "Cap applied via --v1_cap_slot_a.")
+    parser.add_argument("--v1_frac_slot_b",   type=float, default=0.35,
+                        help="Fraction of k for slot B (embedding discovery). "
+                             "Cap applied via --v1_cap_slot_b.")
+    parser.add_argument("--v1_frac_slot_c",   type=float, default=0.20,
+                        help="Fraction of k for slot C (low-confidence). "
+                             "Cap applied via --v1_cap_slot_c.")
+    parser.add_argument("--v1_cap_slot_a",    type=int,   default=8,
+                        help="Hard cap on slot A size regardless of k.")
+    parser.add_argument("--v1_cap_slot_b",    type=int,   default=10,
+                        help="Hard cap on slot B size regardless of k.")
+    parser.add_argument("--v1_cap_slot_c",    type=int,   default=10,
+                        help="Hard cap on slot C size regardless of k.")
 
     # ── FedSPD-specific args ──────────────────────────────────────────
     parser.add_argument("--fedspd_S",    type=int,   default=2,
@@ -547,6 +561,13 @@ def main(args):
             vouch_M              = args.v1_vouch_M,
             low_conf_threshold   = args.v1_low_conf,
             vouch_threshold      = args.v1_vouch_thresh,
+            frac_slot_a          = args.v1_frac_slot_a,
+            frac_slot_b          = args.v1_frac_slot_b,
+            frac_slot_c          = args.v1_frac_slot_c,
+            cap_slot_a           = args.v1_cap_slot_a,
+            cap_slot_b           = args.v1_cap_slot_b,
+            cap_slot_c           = args.v1_cap_slot_c,
+
             triplet_weight_scheme= args.v1_triplet_scheme,
             node_to_cluster      = node_to_cluster,
             eff_weight_thresh    = args.v2_eff_thresh,

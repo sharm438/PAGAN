@@ -115,6 +115,15 @@ class PAGANv1:
                  vouch_M:           int   = 5,
                  low_conf_threshold: float = 0.4,
                  vouch_threshold:   float = 0.3,
+                 # Slot fractions (post-warmup) — must sum to < 1.0
+                 frac_slot_a: float = 0.30,   # warmup friends
+                 frac_slot_b: float = 0.35,   # embedding discovery
+                 frac_slot_c: float = 0.20,   # low-confidence exploration
+                 # Slot D gets remainder (~0.15 at k=20)
+                 # Caps prevent over-allocation at large k
+                 cap_slot_a:  int   = 8,
+                 cap_slot_b:  int   = 10,
+                 cap_slot_c:  int   = 10,
                  # Triplet loss weighting
                  triplet_weight_scheme: str = 'flat',
                  # Diagnostics
@@ -139,6 +148,14 @@ class PAGANv1:
         self.vouch_M             = vouch_M
         self.low_conf_threshold  = low_conf_threshold
         self.vouch_threshold     = vouch_threshold
+        self.frac_slot_a         = frac_slot_a
+        self.frac_slot_b         = frac_slot_b
+        self.frac_slot_c         = frac_slot_c
+        self.cap_slot_a          = cap_slot_a
+        self.cap_slot_b          = cap_slot_b
+        self.cap_slot_c          = cap_slot_c
+        assert frac_slot_a + frac_slot_b + frac_slot_c < 1.0, \
+            "frac_slot_a + frac_slot_b + frac_slot_c must be < 1.0"
         self.triplet_weight_scheme = triplet_weight_scheme
         self.node_to_cluster     = node_to_cluster
         self.eff_thresh          = eff_weight_thresh
@@ -518,16 +535,177 @@ class PAGANv1:
         # ── Post-warmup ────────────────────────────────────────────────
         return self._postwarmup_targets(node_i, k_total, E_list_i)
 
+    # def _confirmation_targets(self, node_i: int, k_total: int) -> list:
+    #     """
+    #     Slot A: best seen friends (top d_tent).
+    #     Slot B: most uncertain seen pairs (obs_count 1–2).
+    #     Slot C: never-observed nodes (coverage gaps).
+    #     Slot D: random fill.
+    #     """
+    #     N = self.N
+    #     targets = set()
+
+    #     # Slot A — confirm best known friends
+    #     d_row = self.d_tent[node_i].copy()
+    #     d_row[node_i] = np.inf
+    #     order = np.argsort(d_row)
+    #     added = 0
+    #     for j in order:
+    #         if int(j) != node_i and np.isfinite(d_row[j]):
+    #             targets.add(int(j))
+    #             added += 1
+    #         if added >= self.K_CONF_A:
+    #             break
+
+    #     # Slot B — uncertain seen pairs (fewest observations)
+    #     uncertain = sorted(
+    #         [(j, self.obs_count[node_i, j])
+    #          for j in range(N)
+    #          if j != node_i
+    #          and 0 < self.obs_count[node_i, j] <= 2
+    #          and j not in targets],
+    #         key=lambda x: x[1]
+    #     )
+    #     for j, _ in uncertain[:self.K_CONF_B]:
+    #         targets.add(j)
+
+    #     # Slot C — coverage gaps (never observed)
+    #     unseen = [j for j in range(N)
+    #               if j != node_i
+    #               and self.obs_count[node_i, j] == 0
+    #               and j not in targets]
+    #     _random.shuffle(unseen)
+    #     for j in unseen[:self.K_CONF_C]:
+    #         targets.add(j)
+
+    #     # Slot D — random fill
+    #     pool = [x for x in range(N) if x != node_i and x not in targets]
+    #     _random.shuffle(pool)
+    #     for c in pool:
+    #         if len(targets) >= k_total:
+    #             break
+    #         targets.add(c)
+
+    #     return list(targets)
+
+    # def _postwarmup_targets(self, node_i: int, k_total: int,
+    #                          E_list_i) -> list:
+    #     """
+    #     Slot A: top W_base (warmup friends).
+    #     Slot B: top D_emb (embedding discovery).
+    #     Slot C: low-confidence pairs (targeted exploration).
+    #     Slot D: random fill.
+    #     """
+    #     N = self.N
+    #     targets = set()
+
+    #     # Slot A — highest W_base peers
+    #     wb_row = self.W_base[node_i].copy()
+    #     wb_row[node_i] = -1.0
+    #     top_wb = np.argsort(-wb_row)
+    #     added = 0
+    #     for j in top_wb:
+    #         if int(j) != node_i:
+    #             targets.add(int(j))
+    #             added += 1
+    #         if added >= self.K_SLOT_A:
+    #             break
+
+    #     # Slot B — highest embedding affinity (discovery)
+    #     if E_list_i is not None:
+    #         my_emb     = E_list_i[node_i].unsqueeze(0)
+    #         emb_d      = torch.norm(E_list_i - my_emb, dim=1)
+    #         emb_sorted = torch.argsort(emb_d).tolist()
+    #         added = 0
+    #         for j in emb_sorted:
+    #             if j != node_i and j not in targets:
+    #                 targets.add(j)
+    #                 added += 1
+    #             if added >= self.K_SLOT_B or len(targets) >= k_total:
+    #                 break
+
+    #     # Slot C — low-confidence pairs (explore uncertain)
+    #     low_conf = sorted(
+    #         [(j, float(self.eff_conf[node_i, j]))
+    #          for j in range(N)
+    #          if j != node_i
+    #          and self.eff_conf[node_i, j] < self.low_conf_threshold
+    #          and j not in targets],
+    #         key=lambda x: x[1]   # lowest confidence first
+    #     )
+    #     for j, _ in low_conf[:self.K_SLOT_C]:
+    #         targets.add(j)
+
+    #     # Slot D — random fill
+    #     pool = [x for x in range(N) if x != node_i and x not in targets]
+    #     _random.shuffle(pool)
+    #     for c in pool:
+    #         if len(targets) >= k_total:
+    #             break
+    #         targets.add(c)
+
+    #     return list(targets)
+
+    def _compute_slot_sizes(self, k_total: int,
+                            n_low_conf: int = 9999) -> dict:
+        """
+        Adaptive slot allocation for any k.
+ 
+        Priority order: A → B → C → D.
+        Each slot has a fraction-based target, a hard cap, and a floor of 2.
+        Slot D always gets the remainder (guaranteed ≥ 1 if k ≥ 5).
+ 
+        At k=10:  A=3  B=3  C=2  D=2
+        At k=20:  A=6  B=7  C=4  D=3
+        At k=50:  A=8  B=10 C=10 D=22
+        At k=99:  A=8  B=10 C=10 D=71
+        """
+        remaining = k_total
+ 
+        # Slot A: warmup friends — quality not quantity
+        k_a = max(2, min(self.cap_slot_a,
+                         round(self.frac_slot_a * k_total)))
+        k_a = min(k_a, remaining - 3)   # leave room for B + D
+        k_a = max(k_a, 0)
+        remaining -= k_a
+ 
+        # Slot B: embedding discovery
+        k_b = max(2, min(self.cap_slot_b,
+                         round(self.frac_slot_b * k_total)))
+        k_b = min(k_b, remaining - 2)   # leave room for D
+        k_b = max(k_b, 0)
+        remaining -= k_b
+ 
+        # Slot C: low-confidence targeted exploration
+        # Bounded by actual number of low-conf pairs that exist
+        k_c = max(0, min(self.cap_slot_c,
+                         round(self.frac_slot_c * k_total),
+                         n_low_conf,
+                         remaining - 1))   # leave room for D
+        remaining -= k_c
+ 
+        # Slot D: random fill — always gets the remainder
+        k_d = max(1, remaining)
+ 
+        return dict(k_a=k_a, k_b=k_b, k_c=k_c, k_d=k_d)
+
     def _confirmation_targets(self, node_i: int, k_total: int) -> list:
         """
         Slot A: best seen friends (top d_tent).
         Slot B: most uncertain seen pairs (obs_count 1–2).
         Slot C: never-observed nodes (coverage gaps).
         Slot D: random fill.
+        Sizes computed adaptively from k_total.
         """
         N = self.N
+ 
+        # Count never-seen for slot C sizing
+        n_unseen = int((self.obs_count[node_i] == 0).sum()) - 1  # exclude self
+        slots = self._compute_slot_sizes(k_total, n_low_conf=n_unseen)
+        k_a, k_b, k_c = slots['k_a'], slots['k_b'], slots['k_c']
+ 
         targets = set()
-
+ 
         # Slot A — confirm best known friends
         d_row = self.d_tent[node_i].copy()
         d_row[node_i] = np.inf
@@ -537,9 +715,9 @@ class PAGANv1:
             if int(j) != node_i and np.isfinite(d_row[j]):
                 targets.add(int(j))
                 added += 1
-            if added >= self.K_CONF_A:
+            if added >= k_a:
                 break
-
+ 
         # Slot B — uncertain seen pairs (fewest observations)
         uncertain = sorted(
             [(j, self.obs_count[node_i, j])
@@ -549,18 +727,18 @@ class PAGANv1:
              and j not in targets],
             key=lambda x: x[1]
         )
-        for j, _ in uncertain[:self.K_CONF_B]:
+        for j, _ in uncertain[:k_b]:
             targets.add(j)
-
+ 
         # Slot C — coverage gaps (never observed)
         unseen = [j for j in range(N)
                   if j != node_i
                   and self.obs_count[node_i, j] == 0
                   and j not in targets]
         _random.shuffle(unseen)
-        for j in unseen[:self.K_CONF_C]:
+        for j in unseen[:k_c]:
             targets.add(j)
-
+ 
         # Slot D — random fill
         pool = [x for x in range(N) if x != node_i and x not in targets]
         _random.shuffle(pool)
@@ -568,7 +746,7 @@ class PAGANv1:
             if len(targets) >= k_total:
                 break
             targets.add(c)
-
+ 
         return list(targets)
 
     def _postwarmup_targets(self, node_i: int, k_total: int,
@@ -578,10 +756,18 @@ class PAGANv1:
         Slot B: top D_emb (embedding discovery).
         Slot C: low-confidence pairs (targeted exploration).
         Slot D: random fill.
+        Sizes computed adaptively from k_total.
         """
         N = self.N
+ 
+        # Count low-conf pairs for slot C sizing
+        n_low_conf = int(
+            (self.eff_conf[node_i] < self.low_conf_threshold).sum()) - 1
+        slots = self._compute_slot_sizes(k_total, n_low_conf=n_low_conf)
+        k_a, k_b, k_c = slots['k_a'], slots['k_b'], slots['k_c']
+ 
         targets = set()
-
+ 
         # Slot A — highest W_base peers
         wb_row = self.W_base[node_i].copy()
         wb_row[node_i] = -1.0
@@ -591,9 +777,9 @@ class PAGANv1:
             if int(j) != node_i:
                 targets.add(int(j))
                 added += 1
-            if added >= self.K_SLOT_A:
+            if added >= k_a:
                 break
-
+ 
         # Slot B — highest embedding affinity (discovery)
         if E_list_i is not None:
             my_emb     = E_list_i[node_i].unsqueeze(0)
@@ -604,9 +790,9 @@ class PAGANv1:
                 if j != node_i and j not in targets:
                     targets.add(j)
                     added += 1
-                if added >= self.K_SLOT_B or len(targets) >= k_total:
+                if added >= k_b or len(targets) >= k_total:
                     break
-
+ 
         # Slot C — low-confidence pairs (explore uncertain)
         low_conf = sorted(
             [(j, float(self.eff_conf[node_i, j]))
@@ -614,11 +800,11 @@ class PAGANv1:
              if j != node_i
              and self.eff_conf[node_i, j] < self.low_conf_threshold
              and j not in targets],
-            key=lambda x: x[1]   # lowest confidence first
+            key=lambda x: x[1]
         )
-        for j, _ in low_conf[:self.K_SLOT_C]:
+        for j, _ in low_conf[:k_c]:
             targets.add(j)
-
+ 
         # Slot D — random fill
         pool = [x for x in range(N) if x != node_i and x not in targets]
         _random.shuffle(pool)
@@ -626,7 +812,7 @@ class PAGANv1:
             if len(targets) >= k_total:
                 break
             targets.add(c)
-
+ 
         return list(targets)
 
     # ------------------------------------------------------------------
