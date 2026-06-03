@@ -219,7 +219,8 @@ class PAGANv1:
 
         # ── Output ────────────────────────────────────────────────────
         self.last_W = None
-        
+        self.soft_metrics_log: list = []
+
         # ── Aggregation weight snapshots (for affinity plots) ─────────
         self.snapshot_rounds = PAGANv1._build_snapshot_rounds(
             confirm_start    = self.confirm_start,
