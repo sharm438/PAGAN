@@ -1168,10 +1168,18 @@ def main(args):
                         sch.step()
  
                 # 6. Embedding monitoring every 5 rounds during warmup
-                if rnd < args.v2_warmup_rounds and rnd % 5 == 0:
+                # Dense distance monitoring: every round during warmup + 10 rounds after
+                post_warmup_buffer = 10
+                in_dense_window = rnd < args.v2_warmup_rounds + post_warmup_buffer
+
+                if in_dense_window:
+                    compute_recall = (rnd % 5 == 0)   # recall only every 5 rounds
                     entry = pagan_v1_protocol.monitor_embeddings(
-                        rnd, E_list, node_to_cluster)
-                    metrics['v1_emb_stats'].append(entry)
+                        rnd, E_list, node_to_cluster,
+                        compute_recall=compute_recall)
+                    # Route to correct log in metrics
+                    if compute_recall and 'mean_k_full_recall' in entry:
+                        metrics['v1_emb_stats'].append(entry)   # recall entries
  
                 prev_ranked_neighbors = ranked_neighbors
                 prev_ranked_dists     = ranked_dists
@@ -1304,9 +1312,10 @@ def main(args):
                     emb_stats['round'] = rnd
                     metrics['v1_emb_stats'].append(emb_stats)
                     print(f"  [v1 emb rnd {rnd:3d}] "
-                          f"tp@5={emb_stats['tp_at_5']:.3f}  "
-                          f"tp@10={emb_stats['tp_at_10']:.3f}  "
-                          f"tp@15={emb_stats['tp_at_15']:.3f}")
+                            f"k_recall: mean={emb_stats.get('mean_k_full_recall', 0):.1f}  "
+                            f"median={emb_stats.get('median_k_full_recall', 0):.1f}  "
+                            f"q90={emb_stats.get('q90_k_full_recall', 0):.1f}  "
+                            f"sep={emb_stats.get('sep_ratio', 0):.3f}")
 
                 # Parallel eval
                 if args.num_workers > 0 and worker_pool is not None:
@@ -1401,6 +1410,7 @@ def main(args):
         metrics['v1_summary']['post_discovered']  = scouts['post_discovered_count']
         metrics['v1_summary']['missed']           = scouts['missed_count']
 
+        metrics['v1_emb_dist_log'] = pagan_v1_protocol.emb_dist_log
         np.savez_compressed(
             filename + '_v1_state',
             d_tent     = pagan_v1_protocol.d_tent,

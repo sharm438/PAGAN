@@ -127,6 +127,7 @@ class PAGANv1:
                  # Triplet loss weighting
                  triplet_weight_scheme: str = 'flat',
                  emb_scale_recalib_every: int = 0,   # 0=disabled, N=recalibrate every N rounds
+
                  # Diagnostics
                  node_to_cluster:   np.ndarray = None,
                  eff_weight_thresh: float = 0.02,
@@ -217,6 +218,9 @@ class PAGANv1:
         self.scout_events:     list = []   # {round, node_i, node_j, warmup_conf, vouch}
         self.scout_count:      int  = 0    # total scout events
 
+        self.emb_quality_log: list = []   # sparse: recall rounds (every 5)
+        self.emb_dist_log:    list = []   # dense: distances every monitored round  
+        
         # ── Output ────────────────────────────────────────────────────
         self.last_W = None
         self.soft_metrics_log: list = []
@@ -946,38 +950,34 @@ class PAGANv1:
 
         return torch.mm(W, node_states).detach()
 
-    # ------------------------------------------------------------------
-    # Embedding quality monitoring (call every 5 rounds during warmup)
-    # ------------------------------------------------------------------
     def monitor_embeddings(self, rnd: int, E_list,
-                            node_to_cluster: np.ndarray) -> dict:
+                        node_to_cluster: np.ndarray,
+                        compute_recall: bool = True) -> dict:
         """
-        Computes:
-          - tp@5, tp@10, tp@15
-          - mean intra-cluster and inter-cluster embedding distances
-          - separation ratio = inter_mean / intra_mean
-        Plateau detection: if tp@5 hasn't improved >0.01 in last 3 evals,
-        flags self.plateau_round.
+        Always computes:
+        - intra_mean, inter_mean, sep_ratio
+        → stored in emb_dist_log every call (dense, for panel B)
+
+        When compute_recall=True also computes:
+        - mean/median/q90 k_full_recall
+        → stored in emb_quality_log (sparse, for panel A)
+
+        Plateau detection driven by sep_ratio.
         """
         N   = self.N
         ntc = node_to_cluster
 
-        tp5 = tp10 = tp15 = 0.0
         intra_list = []
         inter_list = []
 
+        # ── Distances (always computed) ───────────────────────────────
         for i in range(N):
             Ei       = E_list[i].detach().cpu().float().numpy()
             self_emb = Ei[i]
             d_row    = np.linalg.norm(Ei - self_emb, axis=1)
             d_row[i] = np.inf
-            order    = np.argsort(d_row)
 
-            my_c  = ntc[i]
-            tp5  += sum(1 for j in order[:5]  if ntc[j] == my_c) / 5
-            tp10 += sum(1 for j in order[:10] if ntc[j] == my_c) / 10
-            tp15 += sum(1 for j in order[:15] if ntc[j] == my_c) / 15
-
+            my_c = ntc[i]
             for j in range(N):
                 if j == i or np.isinf(d_row[j]):
                     continue
@@ -986,39 +986,81 @@ class PAGANv1:
                 else:
                     inter_list.append(float(d_row[j]))
 
-        tp5  /= N
-        tp10 /= N
-        tp15 /= N
         intra_mean = float(np.mean(intra_list)) if intra_list else 0.0
         inter_mean = float(np.mean(inter_list)) if inter_list else 0.0
         sep_ratio  = inter_mean / max(intra_mean, 1e-8)
 
-        entry = dict(round=rnd, tp_at_5=tp5, tp_at_10=tp10, tp_at_15=tp15,
-                     intra_mean=intra_mean, inter_mean=inter_mean,
-                     sep_ratio=sep_ratio)
-        self.emb_quality_log.append(entry)
+        dist_entry = dict(round=rnd,
+                        intra_mean=intra_mean,
+                        inter_mean=inter_mean,
+                        sep_ratio=sep_ratio)
+        self.emb_dist_log.append(dist_entry)
 
-        if self.verbose:
-            print(f"  [v1 emb rnd {rnd:3d}] "
-                  f"tp@5={tp5:.3f}  tp@10={tp10:.3f}  tp@15={tp15:.3f}  "
-                  f"sep={sep_ratio:.2f}  "
-                  f"intra={intra_mean:.4f}  inter={inter_mean:.4f}")
-
-        # Plateau detection
-        self._tp5_history.append(tp5)
+        # ── Plateau detection (driven by sep_ratio) ────────────────────
+        self._tp5_history.append(sep_ratio)
         if (self.plateau_round < 0
-                and len(self._tp5_history) >= 3
-                and tp5 > 0.5):
-            recent      = self._tp5_history[-3:]
+                and len(self._tp5_history) >= 4
+                and sep_ratio > 1.2):
+            recent      = self._tp5_history[-4:]
             improvement = max(recent) - min(recent)
-            if improvement < 0.01:
+            if improvement < 0.05:
                 self.plateau_round = rnd
                 if self.verbose:
-                    print(f"  [v1 emb] *** PLATEAU at round {rnd} "
-                          f"(tp@5={tp5:.3f}) — warmup may not need "
-                          f"to run longer ***")
+                    print(f"  [v1 emb] *** PLATEAU at round {rnd + 1} "
+                        f"(sep_ratio={sep_ratio:.3f}) — warmup may not "
+                        f"need to run longer ***")
 
-        return entry
+        # ── Recall (only when requested) ──────────────────────────────
+        if compute_recall:
+            k_full_recall_list = []
+            for i in range(N):
+                Ei       = E_list[i].detach().cpu().float().numpy()
+                self_emb = Ei[i]
+                d_row    = np.linalg.norm(Ei - self_emb, axis=1)
+                d_row[i] = np.inf
+                order    = np.argsort(d_row).tolist()
+
+                my_c    = ntc[i]
+                friends = {j for j in range(N) if j != i and ntc[j] == my_c}
+                if not friends:
+                    continue
+
+                found  = 0
+                k_full = N
+                for rank, j in enumerate(order):
+                    if j in friends:
+                        found += 1
+                    if found == len(friends):
+                        k_full = rank + 1
+                        break
+                k_full_recall_list.append(k_full)
+
+            mean_k   = float(np.mean(k_full_recall_list))
+            med_k    = float(np.median(k_full_recall_list))
+            q90_k    = float(np.percentile(k_full_recall_list, 90))
+
+            quality_entry = dict(round=rnd,
+                                mean_k_full_recall   = mean_k,
+                                median_k_full_recall = med_k,
+                                q90_k_full_recall    = q90_k,
+                                intra_mean=intra_mean,
+                                inter_mean=inter_mean,
+                                sep_ratio=sep_ratio)
+            self.emb_quality_log.append(quality_entry)
+
+            if self.verbose:
+                print(f"  [v1 emb rnd {rnd + 1:3d}] "
+                    f"k_recall: mean={mean_k:.1f}  "
+                    f"median={med_k:.1f}  q90={q90_k:.1f}  "
+                    f"sep={sep_ratio:.3f}  "
+                    f"intra={intra_mean:.4f}  inter={inter_mean:.4f}")
+            return quality_entry
+
+        if self.verbose:
+            print(f"  [v1 dist rnd {rnd + 1:3d}] "
+                f"sep={sep_ratio:.3f}  "
+                f"intra={intra_mean:.4f}  inter={inter_mean:.4f}")
+        return dist_entry
 
     # ------------------------------------------------------------------
     # Triplet loss evidence weights
