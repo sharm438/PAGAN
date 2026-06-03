@@ -313,50 +313,134 @@ class TrainingPlotter:
                             node_to_cluster: np.ndarray = None,
                             rounds_to_plot: list = None,
                             window: int = 10,
+                            W_snap_path: str = None,
                             save_prefix: str = None):
         """
-        Bar-chart snapshots of A[anchor, :] at several training rounds.
-        Shows how affinity distribution evolves post-warmup.
-        Useful to confirm strangers lose affinity mass over time.
+        Bar-chart snapshots of aggregation weight (or affinity proxy) for
+        `anchor` node at several training rounds.
+
+        Uses exact PAGANv1 aggregation weights (W_snapshots.npz) when available.
+        Falls back to distance-based affinity proxy from shadow registry otherwise.
+
+        Parameters
+        ----------
+        shadow_path   : path to _shadow.npz
+        anchor        : node index whose outgoing weights to plot
+        rounds_to_plot: list of 1-indexed round numbers to display.
+                        If None, attempts to read from metrics summary
+                        (v1_summary.snapshot_rounds), then falls back to
+                        [25, 50, 100, 250, 500].
+        window        : rolling window for fallback affinity proxy (ignored
+                        when exact W snapshots are available)
+        W_snap_path   : path to _W_snapshots.npz.  If None, auto-detected
+                        by replacing '_shadow.npz' with '_W_snapshots.npz'.
         """
         reg = ShadowRegistry.load(shadow_path)
         ntc = node_to_cluster if node_to_cluster is not None \
-              else self.node_to_cluster
+            else self.node_to_cluster
         if ntc is None:
+            print("[affinity_snapshots] node_to_cluster required.")
             return
 
-        N    = reg.N
-        sort_idx = np.argsort(ntc)
+        # ── Try to load exact aggregation weight snapshots ─────────────
+        if W_snap_path is None:
+            W_snap_path = shadow_path.replace('_shadow.npz', '_W_snapshots.npz')
+        W_snaps = None
+        if os.path.exists(W_snap_path):
+            W_snaps = np.load(W_snap_path)
+            print(f"[affinity_snapshots] Using exact W snapshots: {W_snap_path}")
+        else:
+            print(f"[affinity_snapshots] W_snapshots not found, "
+                f"falling back to distance-based affinity proxy.")
 
+        # ── Determine rounds to plot (1-indexed for display) ───────────
         if rounds_to_plot is None:
-            total = reg.R
-            # rounds_to_plot = [total // 5, 2*total//5,
-            #                     3*total//5, 4*total//5, total-1]
-            rounds_to_plot = [25, 50, 100, 250, 500]
+            # Try to read from saved summary first
+            summary = self.metrics.get('v1_summary', {})
+            saved_snaps = summary.get('snapshot_rounds', None)
+            if saved_snaps is not None:
+                # saved_snaps are 0-indexed rnd values → convert to 1-indexed
+                all_display = sorted(r + 1 for r in saved_snaps)
+            elif W_snaps is not None:
+                # Infer from W_snaps keys: 'rnd_0', 'rnd_24', etc.
+                all_display = sorted(
+                    int(k.replace('rnd_', '')) + 1
+                    for k in W_snaps.files
+                    if k.startswith('rnd_')
+                )
+            else:
+                all_display = [25, 50, 100, 250, 500]
+            # Pick a manageable subset: up to 5 nicely spaced rounds
+            if len(all_display) > 5:
+                # Always include first and last, fill middle
+                step = max(1, (len(all_display) - 2) // 3)
+                rounds_to_plot = (
+                    [all_display[0]]
+                    + all_display[1:-1:step][:3]
+                    + [all_display[-1]]
+                )
+                # Deduplicate while preserving order
+                seen = set()
+                rounds_to_plot = [r for r in rounds_to_plot
+                                if not (r in seen or seen.add(r))]
+            else:
+                rounds_to_plot = all_display
+
+        N        = reg.N
+        sort_idx = np.argsort(ntc)
+        n_panels = len(rounds_to_plot)
+
         num_clusters = int(ntc.max()) + 1
         cmap_c = cm.get_cmap("tab20", max(num_clusters, 2))
 
-        fig, axes = plt.subplots(1, len(rounds_to_plot),
-                                  figsize=(5*len(rounds_to_plot), 4),
-                                  sharey=True)
-        if len(rounds_to_plot) == 1:
+        fig, axes = plt.subplots(1, n_panels,
+                                figsize=(5 * n_panels, 4),
+                                sharey=True)
+        if n_panels == 1:
             axes = [axes]
 
-        for ax, r in zip(axes, rounds_to_plot):
-            A  = reg.affinity_vector(anchor, end_round=r, window=window)
+        using_exact = False   # track for y-label
+
+        for ax, r_display in zip(axes, rounds_to_plot):
+            r_internal = r_display - 1   # 0-indexed rnd
+
+            # ── Get affinity / weight vector ──────────────────────────
+            key = f'rnd_{r_internal}'
+            if W_snaps is not None and key in W_snaps:
+                # Exact aggregation weights — sum to 1
+                A = W_snaps[key][anchor, :].astype(np.float32)
+                using_exact = True
+            else:
+                # Fallback: distance-based proxy
+                A = reg.affinity_vector(anchor,
+                                        end_round=r_internal,
+                                        window=window)
+
+            # ── Plot bar chart sorted by cluster ──────────────────────
             A_sorted = A[sort_idx]
-            colors   = [cmap_c(ntc[j]) for j in sort_idx]
+            # Replace NaN with 0 for plotting
+            A_sorted = np.where(np.isnan(A_sorted), 0.0, A_sorted)
+            colors = [cmap_c(ntc[j]) for j in sort_idx]
+
             ax.bar(range(N), A_sorted, color=colors, width=1.0)
-            ax.set_title(f"Round {r}")
+            ax.set_title(f"Round {r_display}")
             ax.set_xlabel("Node (sorted by cluster)")
-            # cluster boundaries
+
+            # Cluster boundary lines
             clusters = ntc[sort_idx]
             for b in np.where(np.diff(clusters))[0] + 1:
                 ax.axvline(x=b - 0.5, color="black", lw=0.5, alpha=0.4)
 
-        axes[0].set_ylabel(f"Affinity (window={window})")
-        fig.suptitle(f"Affinity snapshots — Node {anchor} "
-                     f"[cluster {ntc[anchor]}]", y=1.02)
+        # ── Y-axis label and title ─────────────────────────────────────
+        y_label = ("Aggregation weight"
+                if using_exact
+                else f"Affinity proxy (window={window})")
+        axes[0].set_ylabel(y_label)
+
+        fig.suptitle(
+            f"Affinity snapshots — Node {anchor} [cluster {ntc[anchor]}]",
+            y=1.02)
+
         plt.tight_layout()
         prefix = save_prefix or f"{self.exp_name}_aff_node{anchor}"
         path   = f"outputs/{prefix}_snapshots.png"

@@ -126,6 +126,7 @@ class PAGANv1:
                  cap_slot_c:  int   = 10,
                  # Triplet loss weighting
                  triplet_weight_scheme: str = 'flat',
+                 
                  # Diagnostics
                  node_to_cluster:   np.ndarray = None,
                  eff_weight_thresh: float = 0.02,
@@ -217,7 +218,14 @@ class PAGANv1:
 
         # ── Output ────────────────────────────────────────────────────
         self.last_W = None
-        self.soft_metrics_log: list = []
+        
+        # ── Aggregation weight snapshots (for affinity plots) ─────────
+        self.snapshot_rounds = PAGANv1._build_snapshot_rounds(
+            confirm_start    = self.confirm_start,
+            warmup_rounds    = warmup_rounds,
+            total_rounds     = total_rounds,
+            step             = 50)
+        self.W_snapshots: dict = {}   # {rnd: np.ndarray [N, N]}
 
         if verbose:
             print(f"[PAGANv1] init: N={num_nodes}  W={warmup_rounds}  "
@@ -227,7 +235,8 @@ class PAGANv1:
                   f"  vouch: M={vouch_M}  low_conf_thresh={low_conf_threshold}  "
                   f"vouch_thresh={vouch_threshold}\n"
                   f"  τ: {tau_0}→{tau_min} (hl={tau_half_life})  "
-                  f"triplet='{triplet_weight_scheme}'")
+                  f"triplet='{triplet_weight_scheme}'"
+                  f"  snapshot_rounds: {self.snapshot_rounds}")
 
     # ------------------------------------------------------------------
     # Temperature schedule (identical to v2)
@@ -240,6 +249,37 @@ class PAGANv1:
         ) / max(self.tau_half_life, 1.0)
         return max(self.tau_min, self.tau_0 * math.exp(-lam * t))
 
+    @staticmethod
+    def _build_snapshot_rounds(confirm_start: int, warmup_rounds: int,
+                                total_rounds: int, step: int = 50) -> list:
+        """
+        Build snapshot rounds (0-indexed rnd values).
+        Display rounds = rnd + 1, handled in plot_training.
+
+        Always includes:
+        confirm_start - 1  → displays as round confirm_start
+        warmup_rounds - 1  → displays as round warmup_rounds
+        warmup_rounds + 4  → displays as 5 rounds post-warmup
+        step-1, 2*step-1   → displays as step, 2*step, ...
+        total_rounds - 1   → displays as total_rounds
+        """
+        snaps = set()
+        W = warmup_rounds
+        T = total_rounds
+
+        if confirm_start > 0:
+            snaps.add(max(0, confirm_start - 1))   # displays as confirm_start
+        snaps.add(max(0, W - 1))                   # displays as W
+        snaps.add(min(W + 4, T - 1))              # displays as W+5
+
+        r = step - 1
+        while r < T:
+            snaps.add(r)                            # displays as step, 2*step...
+            r += step
+
+        snaps.add(T - 1)                           # displays as T
+
+        return sorted(snaps)
     # ------------------------------------------------------------------
     # Tent weight for a given round
     # ------------------------------------------------------------------
