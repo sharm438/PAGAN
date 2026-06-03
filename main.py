@@ -219,7 +219,9 @@ def parse_args():
     parser.add_argument("--v4_trust_log_eps",      type=float, default=1e-3,
                         help="Epsilon in log(trust+eps); floor for logits.")
 
-
+    parser.add_argument("--v1_emb_scale_recalib", type=int, default=0,
+                        help="Recalibrate embedding scale every N rounds post-warmup. "
+                            "0 = disabled (default).")
     return parser.parse_args()
 
 
@@ -569,6 +571,7 @@ def main(args):
             cap_slot_c           = args.v1_cap_slot_c,
 
             triplet_weight_scheme= args.v1_triplet_scheme,
+            emb_scale_recalib_every = args.v1_emb_scale_recalib,
             node_to_cluster      = node_to_cluster,
             eff_weight_thresh    = args.v2_eff_thresh,
             debug_node           = 0,

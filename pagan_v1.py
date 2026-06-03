@@ -126,7 +126,7 @@ class PAGANv1:
                  cap_slot_c:  int   = 10,
                  # Triplet loss weighting
                  triplet_weight_scheme: str = 'flat',
-                 
+                 emb_scale_recalib_every: int = 0,   # 0=disabled, N=recalibrate every N rounds
                  # Diagnostics
                  node_to_cluster:   np.ndarray = None,
                  eff_weight_thresh: float = 0.02,
@@ -158,6 +158,7 @@ class PAGANv1:
         assert frac_slot_a + frac_slot_b + frac_slot_c < 1.0, \
             "frac_slot_a + frac_slot_b + frac_slot_c must be < 1.0"
         self.triplet_weight_scheme = triplet_weight_scheme
+        self.emb_scale_recalib_every = emb_scale_recalib_every
         self.node_to_cluster     = node_to_cluster
         self.eff_thresh          = eff_weight_thresh
         self.debug_node          = debug_node
@@ -429,6 +430,30 @@ class PAGANv1:
         np.fill_diagonal(D, 0.0)
         return D
 
+    def _recalibrate_emb_scale(self, D_emb: np.ndarray):
+        """
+        Recalibrate embedding scale using current high-confidence pairs.
+        Called periodically post-warmup when emb_scale_recalib_every > 0.
+        Uses live d_tent (not frozen) for the model-distance reference.
+        """
+        with np.errstate(invalid='ignore', divide='ignore'):
+            d_tent_live = np.where(self.obs_wgt > 0,
+                                self.obs_wsum / self.obs_wgt,
+                                np.inf).astype(np.float32)
+        high_conf = (self.confidence > 0.7) & ~np.eye(self.N, dtype=bool)
+        if high_conf.sum() < 10:
+            return   # not enough pairs to calibrate
+        dt_vals = d_tent_live[high_conf]
+        de_vals = D_emb[high_conf]
+        valid   = np.isfinite(dt_vals) & (de_vals > 1e-8)
+        if valid.sum() < 10:
+            return
+        new_scale = float(np.median(dt_vals[valid]) /
+                        np.median(de_vals[valid]))
+        if self.verbose:
+            print(f"  [v1 emb_scale] recalibrated: "
+                f"{self.emb_scale:.3f} → {new_scale:.3f}")
+        self.emb_scale = new_scale
     # ------------------------------------------------------------------
     # Update W_base — called every post-warmup round
     # ------------------------------------------------------------------
@@ -451,6 +476,14 @@ class PAGANv1:
         if E_list is not None:
             D_emb        = self._compute_emb_dist_matrix(E_list)
             D_emb_scaled = (D_emb * self.emb_scale).astype(np.float32)
+            # Periodic recalibration — needs D_emb, so must be inside this block
+            if (self.emb_scale_recalib_every > 0
+                    and rnd > self.warmup_rounds
+                    and (rnd - self.warmup_rounds) % self.emb_scale_recalib_every == 0):
+                self._recalibrate_emb_scale(D_emb)
+                # Recompute scaled version with updated scale
+                D_emb_scaled = (D_emb * self.emb_scale).astype(np.float32)
+
         else:
             D_emb_scaled = np.full((N, N), np.inf, dtype=np.float32)
             np.fill_diagonal(D_emb_scaled, 0.0)
