@@ -111,9 +111,9 @@ def parse_args():
     parser.add_argument("--v2_warmup_rounds",   type=int,   default=25)
     parser.add_argument("--v2_ema_lambda",      type=float, default=0.95,
                         help="EMA decay for distance history (0.9=fast, 0.99=slow).")
-    parser.add_argument("--v2_tau_0",           type=float, default=2.0,
+    parser.add_argument("--v2_tau_0",           type=float, default=1.0,
                         help="Starting aggregation temperature post-warmup.")
-    parser.add_argument("--v2_tau_min",         type=float, default=0.5,
+    parser.add_argument("--v2_tau_min",         type=float, default=1.0,
                         help="Minimum aggregation temperature.")
     parser.add_argument("--v2_tau_half_life",   type=float, default=200.0,
                         help="Rounds post-warmup for tau to reach midpoint.")
@@ -154,7 +154,7 @@ def parse_args():
     parser.add_argument("--v1_beta_fresh",     type=float, default=0.1,
                         help="Tent weight decay away from W (post-warmup). "
                              "Higher → post-warmup observations fade faster.")
-    parser.add_argument("--v1_count_thresh",   type=int,   default=3,
+    parser.add_argument("--v1_count_thresh",   type=int,   default=5,
                         help="Observation count for full warmup confidence.")
     parser.add_argument("--v1_confirm_start",  type=int,   default=None,
                         help="Round to switch from random to confirmation "
@@ -165,7 +165,7 @@ def parse_args():
                         help="Confidence below this → pair needs vouching.")
     parser.add_argument("--v1_vouch_thresh",   type=float, default=0.3,
                         help="Vouch score needed to lift eff_conf.")
-    parser.add_argument("--v1_triplet_scheme", type=str,   default='flat',
+    parser.add_argument("--v1_triplet_scheme", type=str,   default='inv_sqrt_rank',
                         choices=['flat', 'inv_rank', 'inv_sqrt_rank'],
                         help="Triplet loss rank-weighting scheme.")
     parser.add_argument("--v1_frac_slot_a",   type=float, default=0.30,

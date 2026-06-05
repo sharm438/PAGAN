@@ -1012,49 +1012,55 @@ class PAGANv1:
 
         # ── Recall (only when requested) ──────────────────────────────
         if compute_recall:
-            k_full_recall_list = []
+            # Configurable m values — store all, plot any subset later
+            m_values = [5, 10, 15, 20]
+
+            # Per-m accumulators
+            tp_sums      = {m: 0.0 for m in m_values}   # precision
+            recall_sums  = {m: 0.0 for m in m_values}   # recall
+            n_nodes      = 0
+
             for i in range(N):
                 Ei       = E_list[i].detach().cpu().float().numpy()
                 self_emb = Ei[i]
                 d_row    = np.linalg.norm(Ei - self_emb, axis=1)
                 d_row[i] = np.inf
-                order    = np.argsort(d_row).tolist()
+                order    = np.argsort(d_row)   # full ranking, slice per m
 
                 my_c    = ntc[i]
                 friends = {j for j in range(N) if j != i and ntc[j] == my_c}
                 if not friends:
                     continue
+                n_nodes += 1
 
-                found  = 0
-                k_full = N
-                for rank, j in enumerate(order):
-                    if j in friends:
-                        found += 1
-                    if found == len(friends):
-                        k_full = rank + 1
-                        break
-                k_full_recall_list.append(k_full)
-
-            mean_k   = float(np.mean(k_full_recall_list))
-            med_k    = float(np.median(k_full_recall_list))
-            q90_k    = float(np.percentile(k_full_recall_list, 90))
+                for m in m_values:
+                    top_m = order[:m]
+                    found = sum(1 for j in top_m if j in friends)
+                    tp_sums[m]     += found / m              # precision: found/m
+                    recall_sums[m] += found / len(friends)   # recall: found/n_friends
 
             quality_entry = dict(round=rnd,
-                                mean_k_full_recall   = mean_k,
-                                median_k_full_recall = med_k,
-                                q90_k_full_recall    = q90_k,
                                 intra_mean=intra_mean,
                                 inter_mean=inter_mean,
                                 sep_ratio=sep_ratio)
+
+            for m in m_values:
+                quality_entry[f'tp_at_{m}']     = tp_sums[m]     / max(n_nodes, 1)
+                quality_entry[f'recall_at_{m}'] = recall_sums[m] / max(n_nodes, 1)
+
             self.emb_quality_log.append(quality_entry)
 
             if self.verbose:
+                tp_str     = '  '.join(f'tp@{m}={quality_entry[f"tp_at_{m}"]:.3f}'
+                                    for m in m_values)
+                recall_str = '  '.join(f'rec@{m}={quality_entry[f"recall_at_{m}"]:.3f}'
+                                    for m in m_values)
                 print(f"  [v1 emb rnd {rnd + 1:3d}] "
-                    f"k_recall: mean={mean_k:.1f}  "
-                    f"median={med_k:.1f}  q90={q90_k:.1f}  "
                     f"sep={sep_ratio:.3f}  "
-                    f"intra={intra_mean:.4f}  inter={inter_mean:.4f}")
-            return quality_entry
+                    f"intra={intra_mean:.4f}  inter={inter_mean:.4f}\n"
+                    f"    {tp_str}\n"
+                    f"    {recall_str}")
+            return quality_entry        
 
         if self.verbose:
             print(f"  [v1 dist rnd {rnd + 1:3d}] "
