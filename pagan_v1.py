@@ -220,6 +220,8 @@ class PAGANv1:
 
         self.emb_quality_log: list = []   # sparse: recall rounds (every 5)
         self.emb_dist_log:    list = []   # dense: distances every monitored round  
+
+        self._current_rnd = 0
         
         # ── Output ────────────────────────────────────────────────────
         self.last_W = None
@@ -244,6 +246,56 @@ class PAGANv1:
                   f"triplet='{triplet_weight_scheme}'"
                   f"  snapshot_rounds: {self.snapshot_rounds}")
 
+    def compute_W_base_snapshot(self, E_list) -> np.ndarray:
+        """
+        Compute W_base from current tent distances and embeddings.
+        Safe to call at any round including during warmup.
+        Returns [N, N] float32, rows sum to 1.
+        """
+        N   = self.N
+        tau = self.tau_0   # use tau_0 during warmup (no schedule yet)
+        # If post-warmup, use current tau
+        if self._warmup_finalised:
+            tau = self.tau(self._current_rnd)
+
+        # Live tent distance
+        with np.errstate(invalid='ignore', divide='ignore'):
+            d_tent_live = np.where(self.obs_wgt > 0,
+                                self.obs_wsum / self.obs_wgt,
+                                np.inf).astype(np.float32)
+        np.fill_diagonal(d_tent_live, 0.0)
+
+        # Embedding distance
+        if E_list is not None:
+            D_emb        = self._compute_emb_dist_matrix(E_list)
+            D_emb_scaled = (D_emb * self.emb_scale).astype(np.float32)
+        else:
+            D_emb_scaled = np.full((N, N), np.inf, dtype=np.float32)
+            np.fill_diagonal(D_emb_scaled, 0.0)
+
+        # Confidence — use warmup-only count if pre-finalization
+        if self._warmup_finalised:
+            ec = self.eff_conf
+        else:
+            ec = np.clip(self.obs_count_warmup / max(self.count_threshold, 1),
+                        0.0, 1.0).astype(np.float32)
+            np.fill_diagonal(ec, 1.0)
+
+        # Score
+        d_tent_safe = np.where(np.isfinite(d_tent_live),
+                            d_tent_live, D_emb_scaled)
+        score = (ec * d_tent_safe
+                + (1.0 - ec) * D_emb_scaled).astype(np.float32)
+        np.fill_diagonal(score, 0.0)
+
+        # Global softmax
+        W = np.zeros((N, N), dtype=np.float32)
+        for i in range(N):
+            logits  = -score[i] / max(tau, 1e-8)
+            logits -= logits.max()
+            exp_w   = np.exp(logits)
+            W[i]    = exp_w / (exp_w.sum() + 1e-12)
+        return W
     # ------------------------------------------------------------------
     # Temperature schedule (identical to v2)
     # ------------------------------------------------------------------
@@ -315,6 +367,7 @@ class PAGANv1:
         """
         # Shadow registry (diagnostic plots)
         self.registry.record(rnd, ranked_neighbors, ranked_dists)
+        self._current_rnd = rnd
 
         # Tent-weighted distance update
         w_tent = self._tent_weight(rnd)
@@ -347,6 +400,11 @@ class PAGANv1:
         # Post-warmup: refresh W_base with current embeddings each round
         if rnd >= self.warmup_rounds and self._warmup_finalised and E_list is not None:
             self._update_W_base(E_list, rnd)
+
+        # ── Snapshot save — runs every round including warmup ─────────────
+        self._current_rnd = rnd
+        if rnd in self.snapshot_rounds and E_list is not None:
+            self.W_snapshots[rnd] = self.compute_W_base_snapshot(E_list).copy()
 
     # ------------------------------------------------------------------
     # Warmup finalization (called once at round W)
@@ -1135,6 +1193,7 @@ class PAGANv1:
             'scout_count':   self.scout_count,
             'emb_quality':   self.emb_quality_log,
             'scout_events':  self.scout_events[:100],  # first 100
+            'snapshot_rounds': self.snapshot_rounds,   
         }
 
     def compute_scouts(self, min_lift: float = 0.1) -> dict:

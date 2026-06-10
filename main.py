@@ -1421,6 +1421,14 @@ def main(args):
             last_seen = pagan_v1_protocol.last_seen)
         print(f"[PAGANv1] Saved state -> {filename}_v1_state.npz")
 
+        # Save W_base snapshots for affinity plots
+        if pagan_v1_protocol.W_snapshots:
+            snap_dict = {f'rnd_{r}': W_snap
+                        for r, W_snap in pagan_v1_protocol.W_snapshots.items()}
+            np.savez_compressed(filename + '_W_snapshots', **snap_dict)
+            print(f"[PAGANv1] Saved W snapshots -> {filename}_W_snapshots.npz "
+                f"(rounds: {sorted(pagan_v1_protocol.W_snapshots.keys())})")
+
     # ── Save metrics ──────────────────────────────────────────────────
     if metrics.get('local_split_stats'):
         for rec in metrics['local_split_stats']:
