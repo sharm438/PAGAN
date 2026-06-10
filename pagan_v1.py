@@ -234,6 +234,7 @@ class PAGANv1:
             total_rounds     = total_rounds,
             step             = 50)
         self.W_snapshots: dict = {}   # {rnd: np.ndarray [N, N]}
+        self.recall_saturation_curve: list = []  # mean recall@m for m=1..N, computed at warmup end
 
         if verbose:
             print(f"[PAGANv1] init: N={num_nodes}  W={warmup_rounds}  "
@@ -245,6 +246,43 @@ class PAGANv1:
                   f"  τ: {tau_0}→{tau_min} (hl={tau_half_life})  "
                   f"triplet='{triplet_weight_scheme}'"
                   f"  snapshot_rounds: {self.snapshot_rounds}")
+
+    def compute_recall_saturation(self, E_list,
+                                node_to_cluster: np.ndarray) -> np.ndarray:
+        """
+        Compute mean recall@m for all m from 1 to N at current round.
+        Called once at warmup end. Stored in recall_saturation_curve.
+        recall@m = fraction of true friends found in embedding top-m.
+        """
+        N   = self.N
+        ntc = node_to_cluster
+        recall_by_m = np.zeros(N, dtype=np.float64)
+        n_nodes     = 0
+
+        for i in range(N):
+            Ei       = E_list[i].detach().cpu().float().numpy()
+            self_emb = Ei[i]
+            d_row    = np.linalg.norm(Ei - self_emb, axis=1)
+            d_row[i] = np.inf
+            order    = np.argsort(d_row).tolist()
+
+            my_c    = ntc[i]
+            friends = {j for j in range(N) if j != i and ntc[j] == my_c}
+            if not friends:
+                continue
+            n_nodes += 1
+
+            found = 0
+            for m_idx, j in enumerate(order):
+                if j in friends:
+                    found += 1
+                recall_by_m[m_idx] += found / len(friends)
+
+        if n_nodes > 0:
+            recall_by_m /= n_nodes
+
+        self.recall_saturation_curve = recall_by_m.tolist()
+        return recall_by_m
 
     def compute_W_base_snapshot(self, E_list) -> np.ndarray:
         """

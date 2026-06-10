@@ -1180,7 +1180,15 @@ def main(args):
                     # Route to correct log in metrics
                     if compute_recall and 'mean_k_full_recall' in entry:
                         metrics['v1_emb_stats'].append(entry)   # recall entries
- 
+
+                # At last warmup round, compute recall saturation curve
+                if rnd == args.v2_warmup_rounds - 1:
+                    pagan_v1_protocol.compute_recall_saturation(
+                        E_list, node_to_cluster)
+                    print(f"[v1] Recall saturation computed. "
+                        f"m* (recall=1.0) ≈ "
+                        f"{next((i+1 for i,v in enumerate(pagan_v1_protocol.recall_saturation_curve) if v >= 0.999), 'N/A')}")
+                
                 prev_ranked_neighbors = ranked_neighbors
                 prev_ranked_dists     = ranked_dists
 
@@ -1411,6 +1419,7 @@ def main(args):
         metrics['v1_summary']['missed']           = scouts['missed_count']
 
         metrics['v1_emb_dist_log'] = pagan_v1_protocol.emb_dist_log
+        metrics['v1_recall_saturation'] = pagan_v1_protocol.recall_saturation_curve
         np.savez_compressed(
             filename + '_v1_state',
             d_tent     = pagan_v1_protocol.d_tent,

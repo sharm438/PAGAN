@@ -524,43 +524,29 @@ class TrainingPlotter:
     def warmup_quality(self,
                     v1_state_path: str = None,
                     save_name: str = None):
-        """
-        4-panel dashboard summarising what was learned during warmup.
 
-        Panel A — Embedding precision (tp@5/10/15) over warmup rounds.
-                Plateau marker shows where further warmup adds no value.
-        Panel B — Intra vs inter cluster embedding distances + sep_ratio.
-                Rising sep_ratio confirms embeddings are discriminating.
-        Panel C — Warmup confidence distribution histogram.
-                Shows coverage quality: how many pairs were well-observed.
-        Panel D — d_tent distribution at warmup end, intra vs inter cluster.
-                Shows the distance signal is already discriminative before
-                any mixing begins.
-
-        Parameters
-        ----------
-        v1_state_path : path to _v1_state.npz (needed for panels C and D).
-                        Auto-detected from exp_name if None.
-        """
-        # ── Load warmup embedding log ──────────────────────────────────
-        # Dense distance log (every round during warmup + buffer) → panels B
+        # ── Load logs ─────────────────────────────────────────────────
+        # Dense distance log → Panel B (every round during warmup + buffer)
         dist_log = self.metrics.get('v1_emb_dist_log', [])
 
-        # Sparse recall log (every 5 rounds) → panel A
+        # Sparse recall/precision log → Panel A (every 5 rounds)
         recall_log = (self.metrics.get('v1_emb_stats', None)
                     or self.metrics.get('v2_emb_stats', []))
 
-
-        # Split into warmup-time entries and post-warmup entries
         warmup_rounds = (self.metrics.get('v2_warmup_rounds', None)
                         or self.metrics.get('v1_warmup_rounds', 25))
         confirm_start = self.metrics.get('v1_confirm_start', None)
         summary       = self.metrics.get('v1_summary', {})
         plateau_rnd   = summary.get('plateau_round', -1)
 
-        warmup_emb = [e for e in emb_log if e['round'] < warmup_rounds]
+        # Filter each log to warmup window only
+        # dist_log: include a few rounds post-warmup for continuity
+        dist_warmup   = [e for e in dist_log
+                        if e['round'] < warmup_rounds + 10]
+        recall_warmup = [e for e in recall_log
+                        if e['round'] < warmup_rounds]
 
-        # ── Load v1 state (for C and D) ────────────────────────────────
+        # ── Load v1 state ─────────────────────────────────────────────
         state = None
         if v1_state_path is None:
             candidate = f"outputs/{self.exp_name}_v1_state.npz"
@@ -571,26 +557,50 @@ class TrainingPlotter:
 
         ntc = self.node_to_cluster
 
-        # ── Figure ─────────────────────────────────────────────────────
+        # ── Figure ────────────────────────────────────────────────────
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
         ax_A, ax_B = axes[0, 0], axes[0, 1]
         ax_C, ax_D = axes[1, 0], axes[1, 1]
 
-        # ── Panel A: Embedding precision over warmup rounds ────────────
-        if warmup_emb:
-            rnds = np.array([e['round'] + 1 for e in warmup_emb])  # 1-indexed
-            tp5  = np.array([e['tp_at_5']  for e in warmup_emb])
-            tp10 = np.array([e['tp_at_10'] for e in warmup_emb])
-            tp15 = np.array([e.get('tp_at_15', np.nan) for e in warmup_emb])
+        # ── Panel A: Recall over warmup rounds ────────────────────────
+        if recall_warmup:
+            rnds_A = np.array([e['round'] + 1 for e in recall_warmup])
 
-            ax_A.plot(rnds, tp5,  lw=2.0, color='#DD4444',
-                    marker='o', ms=5, label='tp@5')
-            ax_A.plot(rnds, tp10, lw=2.0, color='#4C72B0',
-                    marker='s', ms=5, label='tp@10')
-            ax_A.plot(rnds, tp15, lw=2.0, color='#44AA44',
-                    marker='^', ms=5, label='tp@15')
+            has_recall = 'recall_at_5' in recall_warmup[0]
+            has_tp     = 'tp_at_5'     in recall_warmup[0]
 
-            # Warmup phase markers
+            if has_recall:
+                for m, color, marker in [
+                        (5,  '#DD4444', 'o'),
+                        (10, '#4C72B0', 's'),
+                        (20, '#44AA44', '^')]:
+                    vals = np.array([e.get(f'recall_at_{m}', np.nan)
+                                    for e in recall_warmup])
+                    ax_A.plot(rnds_A, vals, lw=2.0, color=color,
+                            marker=marker, ms=5,
+                            label=f'recall@{m}')
+                ax_A.set_ylabel('Recall (friends found / total friends)')
+                ax_A.set_title('A: Embedding recall during warmup')
+
+            elif has_tp:
+                for key, color, marker, lbl in [
+                        ('tp_at_5',  '#DD4444', 'o', 'tp@5'),
+                        ('tp_at_10', '#4C72B0', 's', 'tp@10'),
+                        ('tp_at_20', '#44AA44', '^', 'tp@20')]:
+                    vals = np.array([e.get(key, np.nan)
+                                    for e in recall_warmup])
+                    ax_A.plot(rnds_A, vals, lw=2.0, color=color,
+                            marker=marker, ms=5, label=lbl)
+                ax_A.set_ylabel('Precision')
+                ax_A.set_title('A: Embedding precision during warmup')
+
+            else:
+                ax_A.text(0.5, 0.5, 'No recall/precision keys in log',
+                        ha='center', va='center',
+                        transform=ax_A.transAxes, fontsize=9, color='grey')
+                ax_A.set_title('A: Embedding recall during warmup')
+
+            # Phase markers
             if confirm_start is not None and confirm_start < warmup_rounds:
                 ax_A.axvline(x=confirm_start, color='orange', lw=1.2,
                             ls='--', alpha=0.7,
@@ -605,29 +615,38 @@ class TrainingPlotter:
 
             ax_A.set_ylim(-0.02, 1.08)
             ax_A.set_xlabel('Round')
-            ax_A.set_ylabel('Top-k precision')
-            ax_A.set_title('A: Embedding precision during warmup')
             ax_A.legend(fontsize=8, loc='lower right')
             ax_A.grid(alpha=0.25)
+
         else:
-            ax_A.text(0.5, 0.5, 'No warmup embedding log found',
-                    ha='center', va='center', transform=ax_A.transAxes)
-            ax_A.set_title('A: Embedding precision during warmup')
+            ax_A.text(0.5, 0.5,
+                    'No recall log found\n(v1_emb_stats missing)\n'
+                    'Check monitor_embeddings() saves recall_at_m keys',
+                    ha='center', va='center',
+                    transform=ax_A.transAxes, fontsize=10, color='grey')
+            ax_A.set_title('A: Embedding recall during warmup')
 
-        # ── Panel B: Distance separation over warmup rounds ───────────
-        if warmup_emb:
-            intra = np.array([e.get('intra_mean', np.nan) for e in warmup_emb])
-            inter = np.array([e.get('inter_mean', np.nan) for e in warmup_emb])
-            sep   = np.array([e.get('sep_ratio',  np.nan) for e in warmup_emb])
+        # ── Panel B: Distance separation (dense log) ──────────────────
+        if dist_warmup:
+            rnds_B = np.array([e['round'] + 1 for e in dist_warmup])
+            intra  = np.array([e.get('intra_mean', np.nan) for e in dist_warmup])
+            inter  = np.array([e.get('inter_mean', np.nan) for e in dist_warmup])
+            sep    = np.array([e.get('sep_ratio',  np.nan) for e in dist_warmup])
 
-            ax_B.plot(rnds, intra, lw=2.0, color='#4C72B0',
-                    marker='o', ms=4, label='intra-cluster')
-            ax_B.plot(rnds, inter, lw=2.0, color='#DD4444',
-                    marker='o', ms=4, label='inter-cluster')
-            ax_B.fill_between(rnds, intra, inter,
+            ax_B.plot(rnds_B, intra, lw=2.0, color='#4C72B0',
+                    marker='o', ms=3, label='intra-cluster')
+            ax_B.plot(rnds_B, inter, lw=2.0, color='#DD4444',
+                    marker='o', ms=3, label='inter-cluster')
+            ax_B.fill_between(rnds_B, intra, inter,
                             where=(inter >= intra),
                             alpha=0.12, color='#44AA44',
                             label='separation gap')
+
+            # Warmup end marker
+            ax_B.axvline(x=warmup_rounds, color='black', lw=1.2,
+                        ls='--', alpha=0.6,
+                        label=f'warmup end (r={warmup_rounds})')
+
             ax_B.set_xlabel('Round')
             ax_B.set_ylabel('Mean embedding distance')
             ax_B.set_title('B: Intra vs inter cluster embedding distance')
@@ -636,127 +655,96 @@ class TrainingPlotter:
 
             # Sep ratio on twin axis
             ax_B2 = ax_B.twinx()
-            ax_B2.plot(rnds, sep, lw=1.5, color='#44AA44',
+            ax_B2.plot(rnds_B, sep, lw=1.5, color='#44AA44',
                     ls='--', alpha=0.7, label='sep ratio')
             ax_B2.set_ylabel('sep ratio (inter/intra)', color='#44AA44')
             ax_B2.tick_params(axis='y', labelcolor='#44AA44')
             ax_B2.legend(fontsize=8, loc='lower right')
         else:
-            ax_B.text(0.5, 0.5, 'No warmup embedding log found',
-                    ha='center', va='center', transform=ax_B.transAxes)
+            ax_B.text(0.5, 0.5,
+                    'No distance log found\n(v1_emb_dist_log)\n'
+                    'Add metrics[\'v1_emb_dist_log\'] = '
+                    'pagan_v1_protocol.emb_dist_log\nto main.py save block',
+                    ha='center', va='center', transform=ax_B.transAxes,
+                    fontsize=9, color='grey')
             ax_B.set_title('B: Intra vs inter cluster embedding distance')
 
-        # ── Panel C: Confidence distribution histogram ─────────────────
-        if state is not None:
-            N    = state['confidence'].shape[0]
-            conf = state['confidence']
-            off  = ~np.eye(N, dtype=bool)
-            conf_vals = conf[off]
+        # ── Panel C: Recall saturation curve ──────────────────────────
+        recall_sat = self.metrics.get('v1_recall_saturation', [])
+        if recall_sat:
+            m_vals = np.arange(1, len(recall_sat) + 1)
+            ax_C.plot(m_vals, recall_sat, lw=2.0, color='#4C72B0')
+            ax_C.axhline(y=1.0, color='black', lw=0.8, ls='--', alpha=0.4)
 
-            # Bin edges match natural confidence levels
-            # with count_threshold=3: 0, 0.33, 0.67, 1.0
-            bins = np.linspace(0, 1, 21)
-            counts, edges = np.histogram(conf_vals, bins=bins)
-            centers = (edges[:-1] + edges[1:]) / 2
+            # Mark m* where recall first reaches 0.999
+            m_star = next((i + 1 for i, v in enumerate(recall_sat)
+                        if v >= 0.999), None)
+            if m_star:
+                ax_C.axvline(x=m_star, color='#DD4444', lw=1.5,
+                            ls='--', alpha=0.8,
+                            label=f'm* = {m_star} (recall ≈ 1.0)')
+                ax_C.scatter([m_star], [recall_sat[m_star - 1]],
+                            color='#DD4444', s=60, zorder=5)
 
-            # Color bars by confidence level
-            bar_colors = []
-            for c in centers:
-                if c < 0.01:
-                    bar_colors.append('#DD4444')    # never seen — red
-                elif c < 0.35:
-                    bar_colors.append('#FF8844')    # low — orange
-                elif c < 0.70:
-                    bar_colors.append('#4C72B0')    # medium — blue
-                else:
-                    bar_colors.append('#44AA44')    # high — green
-
-            ax_C.bar(centers, counts, width=(edges[1]-edges[0])*0.9,
-                    color=bar_colors, edgecolor='white', lw=0.4)
-
-            mean_conf = float(conf_vals.mean())
-            zero_frac = float((conf_vals < 0.01).mean())
-            full_frac = float((conf_vals >= 1.0).mean())
-            ax_C.axvline(x=mean_conf, color='black', lw=1.5, ls='--',
-                        label=f'mean={mean_conf:.3f}')
-
-            # Annotations
-            ax_C.text(0.97, 0.95,
-                    f"never seen: {zero_frac:.1%}\nfull conf:  {full_frac:.1%}",
-                    transform=ax_C.transAxes, ha='right', va='top',
-                    fontsize=9, family='monospace',
-                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
-
-            ax_C.set_xlabel('Confidence')
-            ax_C.set_ylabel('Directed pair count')
-            ax_C.set_title('C: Warmup confidence distribution')
+            ax_C.set_xlabel('m (embedding top-m)')
+            ax_C.set_ylabel('Mean recall@m')
+            ax_C.set_title('C: Recall saturation curve at warmup end')
+            ax_C.set_ylim(-0.02, 1.08)
             ax_C.legend(fontsize=8)
-            ax_C.grid(alpha=0.20, axis='y')
+            ax_C.grid(alpha=0.25)
         else:
-            ax_C.text(0.5, 0.5, 'v1_state.npz not found\n(needed for panels C and D)',
-                    ha='center', va='center', transform=ax_C.transAxes,
-                    fontsize=10, color='grey')
-            ax_C.set_title('C: Warmup confidence distribution')
+            ax_C.text(0.5, 0.5,
+                    'No recall saturation data\n'
+                    '(v1_recall_saturation missing from metrics)\n'
+                    'Call compute_recall_saturation() at warmup end',
+                    ha='center', va='center',
+                    transform=ax_C.transAxes, fontsize=9, color='grey')
+            ax_C.set_title('C: Recall saturation curve at warmup end')
 
-        # ── Panel D: d_tent distribution at warmup end ────────────────
-        if state is not None and ntc is not None:
-            d_tent = state['d_tent']   # [N, N]
-            N      = d_tent.shape[0]
-            off    = ~np.eye(N, dtype=bool)
+        # ── Panel D: Affinity gap over rounds ─────────────────────────
+        W_snap_path = None
+        if v1_state_path:
+            W_snap_path = v1_state_path.replace(
+                '_v1_state.npz', '_W_snapshots.npz')
 
-            intra_d = []
-            inter_d = []
-            for i in range(N):
-                for j in range(N):
-                    if i == j:
-                        continue
-                    d = float(d_tent[i, j])
-                    if not np.isfinite(d):
-                        continue
-                    if ntc[i] == ntc[j]:
-                        intra_d.append(d)
-                    else:
-                        inter_d.append(d)
+        if W_snap_path and os.path.exists(W_snap_path) and ntc is not None:
+            rnds_gap, gaps, gaps_std = TrainingPlotter._compute_affinity_gap(
+                W_snap_path, ntc)
 
-            # Shared bin range
-            all_d   = intra_d + inter_d
-            d_max   = float(np.percentile(all_d, 99)) if all_d else 5.0
-            bins_d  = np.linspace(0, d_max, 40)
+            if rnds_gap:
+                rnds_arr = np.array(rnds_gap)
+                gaps_arr = np.array(gaps)
+                std_arr  = np.array(gaps_std)
 
-            ax_D.hist(intra_d, bins=bins_d, alpha=0.55, color='#4C72B0',
-                    label=f'intra-cluster (n={len(intra_d):,})',
-                    density=True)
-            ax_D.hist(inter_d, bins=bins_d, alpha=0.55, color='#DD4444',
-                    label=f'inter-cluster (n={len(inter_d):,})',
-                    density=True)
+                ax_D.plot(rnds_arr, gaps_arr, lw=2.0, color='#2166AC',
+                        marker='o', ms=3)
+                ax_D.fill_between(rnds_arr,
+                                gaps_arr - std_arr,
+                                gaps_arr + std_arr,
+                                alpha=0.15, color='#2166AC')
+                ax_D.axhline(y=0, color='black', lw=0.8, ls='--',
+                            alpha=0.4, label='gap = 0')
 
-            if intra_d and inter_d:
-                overlap = float(np.mean(np.array(intra_d) <
-                                        np.median(inter_d)))
-                ax_D.text(0.97, 0.95,
-                        f"intra median: {np.median(intra_d):.3f}\n"
-                        f"inter median: {np.median(inter_d):.3f}\n"
-                        f"intra < inter_median: {overlap:.1%}",
-                        transform=ax_D.transAxes, ha='right', va='top',
-                        fontsize=9, family='monospace',
-                        bbox=dict(boxstyle='round', facecolor='white',
-                                    alpha=0.7))
+                if warmup_rounds:
+                    ax_D.axvline(x=warmup_rounds, color='black', lw=1.2,
+                                ls='--', alpha=0.6,
+                                label=f'warmup end (r={warmup_rounds})')
 
-            ax_D.set_xlabel('d_tent (tent-weighted model distance)')
-            ax_D.set_ylabel('Density')
-            ax_D.set_title('D: Model distance at warmup end — intra vs inter cluster')
-            ax_D.legend(fontsize=8)
-            ax_D.grid(alpha=0.20, axis='y')
+                ax_D.set_xlabel('Round')
+                ax_D.set_ylabel('Mean affinity gap (same − diff cluster)')
+                ax_D.set_title('D: Affinity gap over rounds')
+                ax_D.legend(fontsize=8)
+                ax_D.grid(alpha=0.25)
         else:
-            if ntc is None:
-                msg = 'node_to_cluster not found in metrics'
-            else:
-                msg = 'v1_state.npz not found'
-            ax_D.text(0.5, 0.5, msg, ha='center', va='center',
-                    transform=ax_D.transAxes, fontsize=10, color='grey')
-            ax_D.set_title('D: Model distance at warmup end — intra vs inter cluster')
+            ax_D.text(0.5, 0.5,
+                    'W_snapshots not found\n'
+                    '(auto-detected from v1_state_path)\n'
+                    'Check W_snapshots are saved in main.py',
+                    ha='center', va='center',
+                    transform=ax_D.transAxes, fontsize=9, color='grey')
+            ax_D.set_title('D: Affinity gap over rounds')
 
-        # ── Save ───────────────────────────────────────────────────────
+        # ── Save ──────────────────────────────────────────────────────
         fig.suptitle(f"Warmup quality — {self.exp_name}  "
                     f"(W={warmup_rounds})", fontsize=13, y=1.01)
         plt.tight_layout()
@@ -764,3 +752,44 @@ class TrainingPlotter:
         fig.savefig(path, dpi=150, bbox_inches='tight')
         print(f"[plot] -> {path}")
         plt.close(fig)
+
+    @staticmethod
+    def _compute_affinity_gap(W_snap_path: str,
+                            ntc: np.ndarray) -> tuple:
+        """
+        Compute mean affinity gap per snapshot round.
+        gap = mean W[i,j] for j in same cluster
+            - mean W[i,j] for j in different cluster
+        averaged across all nodes.
+        Returns (rounds_display, gaps, gaps_std)
+        """
+        if not os.path.exists(W_snap_path):
+            return [], [], []
+
+        W_snaps = np.load(W_snap_path)
+        rounds  = sorted(int(k.replace('rnd_', '')) + 1
+                        for k in W_snaps.files
+                        if k.startswith('rnd_'))
+        gaps     = []
+        gaps_std = []
+
+        for r in rounds:
+            W = W_snaps[f'rnd_{r - 1}']   # 0-indexed key
+            N = W.shape[0]
+            node_gaps = []
+            for i in range(N):
+                same = [W[i, j] for j in range(N)
+                        if j != i and ntc[j] == ntc[i]]
+                diff = [W[i, j] for j in range(N)
+                        if ntc[j] != ntc[i]]
+                if same and diff:
+                    node_gaps.append(
+                        float(np.mean(same)) - float(np.mean(diff)))
+            if node_gaps:
+                gaps.append(float(np.mean(node_gaps)))
+                gaps_std.append(float(np.std(node_gaps)))
+            else:
+                gaps.append(0.0)
+                gaps_std.append(0.0)
+
+        return rounds, gaps, gaps_std
