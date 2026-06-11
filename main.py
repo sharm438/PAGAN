@@ -1239,7 +1239,7 @@ def main(args):
             # ================================================================
             # Evaluation
             # ================================================================
-            if args.aggregation == 'p2p' and (rnd + 1) % args.eval_time == 0:
+            if args.aggregation in ('p2p', 'isolated') and (rnd + 1) % args.eval_time == 0:
 
                 # v2 embedding quality (all rounds including warmup)
                 if args.topo == 'paganv2':
