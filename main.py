@@ -716,7 +716,8 @@ def main(args):
         'v4_emb_stats': [],
         'v4_trust_snapshots': [],
         'v1_soft_metrics': [],
-        'v1_emb_stats': []
+        'v1_emb_stats': [],
+        'v1_eval_emb_stats': []
     }
 
     if args.local_test_frac > 0:
@@ -1178,7 +1179,7 @@ def main(args):
                         rnd, E_list, node_to_cluster,
                         compute_recall=compute_recall)
                     # Route to correct log in metrics
-                    if compute_recall and 'mean_k_full_recall' in entry:
+                    if compute_recall:
                         metrics['v1_emb_stats'].append(entry)   # recall entries
 
                 # At last warmup round, compute recall saturation curve
@@ -1318,7 +1319,7 @@ def main(args):
                     emb_stats = compute_emb_stats(
                         E_list, node_to_cluster, jsd_matrix)
                     emb_stats['round'] = rnd
-                    metrics['v1_emb_stats'].append(emb_stats)
+                    metrics['v1_eval_emb_stats'].append(emb_stats)
                     print(f"  [v1 emb rnd {rnd:3d}] "
                             f"k_recall: mean={emb_stats.get('mean_k_full_recall', 0):.1f}  "
                             f"median={emb_stats.get('median_k_full_recall', 0):.1f}  "
