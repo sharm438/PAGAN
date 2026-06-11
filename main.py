@@ -1170,7 +1170,7 @@ def main(args):
  
                 # 6. Embedding monitoring every 5 rounds during warmup
                 # Dense distance monitoring: every round during warmup + 10 rounds after
-                post_warmup_buffer = 10
+                post_warmup_buffer = 50
                 in_dense_window = rnd < args.v2_warmup_rounds + post_warmup_buffer
 
                 if in_dense_window:

@@ -542,9 +542,9 @@ class TrainingPlotter:
         # Filter each log to warmup window only
         # dist_log: include a few rounds post-warmup for continuity
         dist_warmup   = [e for e in dist_log
-                        if e['round'] < warmup_rounds + 10]
+                        if e['round'] < warmup_rounds + 50]
         recall_warmup = [e for e in recall_log
-                        if e['round'] < warmup_rounds]
+                        if e['round'] < warmup_rounds + 50]
 
         # ── Load v1 state ─────────────────────────────────────────────
         state = None
@@ -564,7 +564,7 @@ class TrainingPlotter:
 
         # ── Panel A: Recall over warmup rounds ────────────────────────
         if recall_warmup:
-            rnds_A = np.array([e['round'] + 1 for e in recall_warmup])
+            rnds_A = np.array([e['round']  for e in recall_warmup])
 
             has_recall = 'recall_at_5' in recall_warmup[0]
             has_tp     = 'tp_at_5'     in recall_warmup[0]
@@ -628,7 +628,7 @@ class TrainingPlotter:
 
         # ── Panel B: Distance separation (dense log) ──────────────────
         if dist_warmup:
-            rnds_B = np.array([e['round'] + 1 for e in dist_warmup])
+            rnds_B = np.array([e['round'] for e in dist_warmup])
             intra  = np.array([e.get('intra_mean', np.nan) for e in dist_warmup])
             inter  = np.array([e.get('inter_mean', np.nan) for e in dist_warmup])
             sep    = np.array([e.get('sep_ratio',  np.nan) for e in dist_warmup])
