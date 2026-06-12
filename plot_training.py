@@ -518,6 +518,22 @@ class TrainingPlotter:
         print(f"[plot] -> {path}")
         plt.close(fig)
 
+    @staticmethod
+    def _extract_setup(exp_name: str) -> str:
+        """Extract setup name from exp_name by substring matching."""
+        if 'dir0.1' in exp_name:
+            return 'dir0.1'
+        elif 'dir100' in exp_name:
+            return 'dir100'
+        elif 'patho1' in exp_name:
+            return 'patho1'
+        elif 'patho2' in exp_name:
+            return 'patho2'
+        elif 'patho3' in exp_name:
+            return 'patho3'
+        else:
+            print(f"[_extract_setup] Could not identify setup in '{exp_name}', defaulting to 'dir0.1'")
+            return 'dir0.1'
     # ------------------------------------------------------------------
     # 4. Warmup quality dashboard
     # ------------------------------------------------------------------
@@ -556,7 +572,14 @@ class TrainingPlotter:
             state = np.load(v1_state_path)
 
         ntc = self.node_to_cluster
-
+        N_FRIENDS = {
+            'dir0.1': 9,    # ~9 per node (10-node clusters, N=100)
+            'patho1': 49,   # 50-node clusters
+            'patho2': 19,   # 20-node clusters (use in-cluster only)
+            'patho3': 29,   # 30-node clusters (approximately)
+            'dir100': 9,    # same structure as dir0.1
+        }
+        setup_name = self._extract_setup(self.exp_name)
         # ── Figure ────────────────────────────────────────────────────
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
         ax_A, ax_B = axes[0, 0], axes[0, 1]
@@ -568,7 +591,7 @@ class TrainingPlotter:
 
             has_recall = 'recall_at_5' in recall_warmup[0]
             has_tp     = 'tp_at_5'     in recall_warmup[0]
-
+            n_friends = N_FRIENDS.get(setup_name, 9)
             if has_recall:
                 for m, color, marker in [
                         (5,  '#DD4444', 'o'),
@@ -576,9 +599,11 @@ class TrainingPlotter:
                         (20, '#44AA44', '^')]:
                     vals = np.array([e.get(f'recall_at_{m}', np.nan)
                                     for e in recall_warmup])
-                    ax_A.plot(rnds_A, vals, lw=2.0, color=color,
+                    cap = min(m, n_friends)
+                    metric_vals = vals * n_friends / cap
+                    ax_A.plot(rnds_A, metric_vals, lw=2.0, color=color,
                             marker=marker, ms=5,
-                            label=f'recall@{m}')
+                            label=f'top-{m} purity')
                 ax_A.set_ylabel('Recall (friends found / total friends)')
                 ax_A.set_title('A: Embedding recall during warmup')
 
