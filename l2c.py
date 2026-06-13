@@ -66,7 +66,7 @@ class L2CProtocol:
         Peers each node has seen during warmup (used for freeze ranking).
     """
 
-    def __init__(self, N, k, warmup_rounds, beta, device, seed):
+    def __init__(self, N, k, warmup_rounds, device, seed):
         """
         Parameters
         ----------
@@ -80,7 +80,16 @@ class L2CProtocol:
         self.N = N
         self.k = k
         self.warmup_rounds = warmup_rounds
-        self.beta = beta
+        # Adam optimizer state for alpha logits (matches paper: lr=0.1, wd=0.01)
+        self.adam_lr = 0.1
+        self.adam_wd = 0.01
+        self.adam_b1 = 0.9
+        self.adam_b2 = 0.999
+        self.adam_eps = 1e-8
+        self.adam_m = {}   # first moment per (i,j)
+        self.adam_v = {}   # second moment per (i,j)
+        self.adam_t = {}   # step count per (i,j)
+
         self.device = device
         self.rng = np.random.RandomState(seed)
 
@@ -240,9 +249,34 @@ class L2CProtocol:
             weighted_avg_dot = float(np.dot(w, dots))
             dL_dalpha = w * (dots - weighted_avg_dot)   # [k+1]
 
-            # Gradient descent step on alpha logits
+            # Adam update on alpha logits (paper: lr=0.1, wd=0.01)
             for m_idx, j in enumerate(group):
-                self.alpha[(i, j)] -= self.beta * float(dL_dalpha[m_idx])
+                key = (i, j)
+                grad = float(dL_dalpha[m_idx])
+
+                # L2 weight decay folded into gradient
+                grad += self.adam_wd * self.alpha.get(key, 0.0)
+
+                # Initialise moments on first encounter
+                if key not in self.adam_m:
+                    self.adam_m[key] = 0.0
+                    self.adam_v[key] = 0.0
+                    self.adam_t[key] = 0
+
+                self.adam_t[key] += 1
+                t = self.adam_t[key]
+
+                self.adam_m[key] = (self.adam_b1 * self.adam_m[key]
+                                    + (1 - self.adam_b1) * grad)
+                self.adam_v[key] = (self.adam_b2 * self.adam_v[key]
+                                    + (1 - self.adam_b2) * grad ** 2)
+
+                m_hat = self.adam_m[key] / (1 - self.adam_b1 ** t)
+                v_hat = self.adam_v[key] / (1 - self.adam_b2 ** t)
+
+                self.alpha[key] = (self.alpha.get(key, 0.0)
+                                   - self.adam_lr * m_hat
+                                   / (v_hat ** 0.5 + self.adam_eps))
 
             # Clean up to free VRAM before next node
             del model, logits, loss, g_flat, group_vecs

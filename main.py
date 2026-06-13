@@ -611,7 +611,6 @@ def main(args):
             N=args.num_spokes,
             k=args.k,
             warmup_rounds=args.l2c_warmup,
-            beta=args.l2c_beta,
             device=aggregator_device,
             seed=args.seed,
         )
