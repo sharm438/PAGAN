@@ -127,7 +127,7 @@ class PAGANv1:
                  # Triplet loss weighting
                  triplet_weight_scheme: str = 'flat',
                  emb_scale_recalib_every: int = 0,   # 0=disabled, N=recalibrate every N rounds
-
+                 no_embeddings: bool = False,
                  # Diagnostics
                  node_to_cluster:   np.ndarray = None,
                  eff_weight_thresh: float = 0.02,
@@ -235,6 +235,7 @@ class PAGANv1:
             step             = 50)
         self.W_snapshots: dict = {}   # {rnd: np.ndarray [N, N]}
         self.recall_saturation_curve: list = []  # mean recall@m for m=1..N, computed at warmup end
+        self.no_embeddings = no_embeddings
 
         if verbose:
             print(f"[PAGANv1] init: N={num_nodes}  W={warmup_rounds}  "
@@ -591,10 +592,14 @@ class PAGANv1:
 
         # Blend: high conf → use d_tent; low conf → use embedding
         ec         = self.eff_conf
-        d_tent_safe = np.where(np.isfinite(d_tent_live),
-                               d_tent_live, D_emb_scaled)
-        self.score = (ec * d_tent_safe
-                      + (1.0 - ec) * D_emb_scaled).astype(np.float32)
+        if self.no_embeddings:
+            d_tent_safe = np.where(np.isfinite(d_tent_live), d_tent_live, np.inf)
+            self.score = d_tent_safe.copy()
+        else:
+            d_tent_safe = np.where(np.isfinite(d_tent_live),
+                                d_tent_live, D_emb_scaled)
+            self.score = (ec * d_tent_safe
+                        + (1.0 - ec) * D_emb_scaled).astype(np.float32)
         np.fill_diagonal(self.score, 0.0)
 
         # Global softmax per row
@@ -955,7 +960,7 @@ class PAGANv1:
                 break
  
         # Slot B — highest embedding affinity (discovery)
-        if E_list_i is not None:
+        if not self.no_embeddings and E_list_i is not None:
             my_emb     = E_list_i[node_i].unsqueeze(0)
             emb_d      = torch.norm(E_list_i - my_emb, dim=1)
             emb_sorted = torch.argsort(emb_d).tolist()

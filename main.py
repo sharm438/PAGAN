@@ -222,6 +222,9 @@ def parse_args():
     parser.add_argument("--v1_emb_scale_recalib", type=int, default=0,
                         help="Recalibrate embedding scale every N rounds post-warmup. "
                             "0 = disabled (default).")
+    parser.add_argument("--v1_no_embeddings", action='store_true',
+                    help="Disable embedding contribution to score and sampling. "
+                         "Uses pure model distance only.")
     return parser.parse_args()
 
 
@@ -572,6 +575,7 @@ def main(args):
 
             triplet_weight_scheme= args.v1_triplet_scheme,
             emb_scale_recalib_every = args.v1_emb_scale_recalib,
+            no_embeddings = args.v1_no_embeddings,
             node_to_cluster      = node_to_cluster,
             eff_weight_thresh    = args.v2_eff_thresh,
             debug_node           = 0,
