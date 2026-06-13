@@ -1114,6 +1114,8 @@ class PAGANv1:
             # Per-m accumulators
             tp_sums      = {m: 0.0 for m in m_values}   # precision
             recall_sums  = {m: 0.0 for m in m_values}   # recall
+            purity_sums  = {m: 0.0 for m in m_values}
+
             n_nodes      = 0
 
             for i in range(N):
@@ -1134,6 +1136,8 @@ class PAGANv1:
                     found = sum(1 for j in top_m if j in friends)
                     tp_sums[m]     += found / m              # precision: found/m
                     recall_sums[m] += found / len(friends)   # recall: found/n_friends
+                    purity_sums[m] += found / min(m, len(friends))
+
 
             quality_entry = dict(round=rnd,
                                 intra_mean=intra_mean,
@@ -1143,6 +1147,8 @@ class PAGANv1:
             for m in m_values:
                 quality_entry[f'tp_at_{m}']     = tp_sums[m]     / max(n_nodes, 1)
                 quality_entry[f'recall_at_{m}'] = recall_sums[m] / max(n_nodes, 1)
+                quality_entry[f'purity_at_{m}'] = purity_sums[m] / max(n_nodes, 1)
+
 
             self.emb_quality_log.append(quality_entry)
 
