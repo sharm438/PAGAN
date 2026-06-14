@@ -128,6 +128,7 @@ class PAGANv1:
                  triplet_weight_scheme: str = 'flat',
                  emb_scale_recalib_every: int = 0,   # 0=disabled, N=recalibrate every N rounds
                  no_embeddings: bool = False,
+                 live_distance_mode: bool = False,
                  # Diagnostics
                  node_to_cluster:   np.ndarray = None,
                  eff_weight_thresh: float = 0.02,
@@ -236,6 +237,7 @@ class PAGANv1:
         self.W_snapshots: dict = {}   # {rnd: np.ndarray [N, N]}
         self.recall_saturation_curve: list = []  # mean recall@m for m=1..N, computed at warmup end
         self.no_embeddings = no_embeddings
+        self.live_distance_mode = live_distance_mode
 
         if verbose:
             print(f"[PAGANv1] init: N={num_nodes}  W={warmup_rounds}  "
@@ -418,13 +420,22 @@ class PAGANv1:
             nbrs_np = nbrs.cpu().numpy().astype(int)
             l2_np   = np.sqrt(np.maximum(
                 dsts.cpu().numpy().astype(np.float32), 0.0))
-            for j, d in zip(nbrs_np, l2_np):
-                self.obs_wsum[i, j]  += w_tent * d
-                self.obs_wgt[i, j]   += w_tent
-                self.obs_count[i, j] += 1
-                self.last_seen[i, j]  = rnd    
-                if rnd < self.warmup_rounds:
-                    self.obs_count_warmup[i, j] += 1
+            if self.live_distance_mode:
+                for j, d in zip(nbrs_np, l2_np):
+                    self.obs_wsum[i, j] = d
+                    self.obs_wgt[i, j]  = 1.0
+                    self.obs_count[i, j] += 1
+                    self.last_seen[i, j]  = rnd    
+                    if rnd < self.warmup_rounds:
+                        self.obs_count_warmup[i, j] += 1
+            else:
+                for j, d in zip(nbrs_np, l2_np):
+                    self.obs_wsum[i, j]  += w_tent * d
+                    self.obs_wgt[i, j]   += w_tent
+                    self.obs_count[i, j] += 1
+                    self.last_seen[i, j]  = rnd    
+                    if rnd < self.warmup_rounds:
+                        self.obs_count_warmup[i, j] += 1
 
 
         # Finalise warmup on first post-warmup round
