@@ -235,6 +235,7 @@ class PAGANv1:
             total_rounds     = total_rounds,
             step             = 50)
         self.W_snapshots: dict = {}   # {rnd: np.ndarray [N, N]}
+        self.E_snapshots: dict = {}
         self.recall_saturation_curve: list = []  # mean recall@m for m=1..N, computed at warmup end
         self.no_embeddings = no_embeddings
         self.live_distance_mode = live_distance_mode
@@ -455,6 +456,7 @@ class PAGANv1:
         self._current_rnd = rnd
         if rnd in self.snapshot_rounds and E_list is not None:
             self.W_snapshots[rnd] = self.compute_W_base_snapshot(E_list).copy()
+            self.E_snapshots[rnd] = np.stack([E_list[i].detach().cpu().float().numpy() for i in range(self.N)]) 
 
     # ------------------------------------------------------------------
     # Warmup finalization (called once at round W)

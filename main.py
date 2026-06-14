@@ -1446,6 +1446,12 @@ def main(args):
             print(f"[PAGANv1] Saved W snapshots -> {filename}_W_snapshots.npz "
                 f"(rounds: {sorted(pagan_v1_protocol.W_snapshots.keys())})")
 
+        if pagan_v1_protocol.E_snapshots:
+            snap_dict = {f'rnd_{r}': E_snap
+                        for r, E_snap in pagan_v1_protocol.E_snapshots.items()}
+            np.savez_compressed(filename + '_E_snapshots', **snap_dict)
+            print(f"[PAGANv1] Saved E snapshots → {filename}_E_snapshots.npz")
+
     # ── Save metrics ──────────────────────────────────────────────────
     if metrics.get('local_split_stats'):
         for rec in metrics['local_split_stats']:
