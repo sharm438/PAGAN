@@ -1174,7 +1174,7 @@ def k_regular_random(num_nodes, k, device):
     return neigh_lists, W_local
 
 def federated_aggregation(local_models, weights):
-    stack = torch.stack(local_models)
+    stack = local_models if torch.is_tensor(local_models) else torch.stack(local_models)
     avg = torch.sum(stack * weights.view(-1,1), dim=0)
     return avg
 

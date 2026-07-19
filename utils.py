@@ -609,12 +609,12 @@ def load_data(dataset_name, batch_size, lr, fraction=1.0):
 
     elif dataset_name == 'cifar100':
         num_inputs, num_outputs = 32*32*3, 100
-        net_name = 'resnet50'
+        net_name = 'cifar100_resnet'
         if batch_size is None: batch_size = 128
         transform_train = transforms.Compose([
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(),
-            transforms.AutoAugment(transforms.AutoAugmentPolicy.CIFAR10),
+            #transforms.AutoAugment(transforms.AutoAugmentPolicy.CIFAR10),
             transforms.ToTensor(),
             transforms.Normalize((0.5071,0.4865,0.4409),
                                  (0.2673,0.2564,0.2761))

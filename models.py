@@ -33,8 +33,8 @@ def load_net(net_name, num_inp, num_out, device):
         num_features = model.fc.in_features
         model.fc = nn.Linear(num_features, 200)
         model = model.to(device)
-    elif net_name == 'resnet50':
-        model = models.resnet50(num_classes=100)
+    elif net_name == 'cifar100_resnet':
+        model = make_cifar_resnet(n_blocks_per_stage=5, num_classes=num_out)
     model.to(device)
     return model
 
@@ -327,3 +327,27 @@ class ResNet20(nn.Module):
         x = self.layer3(x)
         x = self.avgpool(x).flatten(1)
         return self.fc(x)
+
+def make_cifar_resnet(n_blocks_per_stage, num_classes):
+    class _Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.in_planes = 16
+            self.conv1 = nn.Conv2d(3, 16, 3, 1, 1, bias=False)
+            self.bn1   = nn.GroupNorm(8, 16)
+            self.layer1 = self._make_layer(16, n_blocks_per_stage, 1)
+            self.layer2 = self._make_layer(32, n_blocks_per_stage, 2)
+            self.layer3 = self._make_layer(64, n_blocks_per_stage, 2)
+            self.avgpool = nn.AdaptiveAvgPool2d(1)
+            self.fc = nn.Linear(64, num_classes)
+        def _make_layer(self, planes, blocks, stride):
+            layers = [BasicBlock(self.in_planes, planes, stride)]
+            self.in_planes = planes * BasicBlock.expansion
+            for _ in range(1, blocks):
+                layers.append(BasicBlock(self.in_planes, planes))
+            return nn.Sequential(*layers)
+        def forward(self, x):
+            x = F.relu(self.bn1(self.conv1(x)))
+            x = self.layer1(x); x = self.layer2(x); x = self.layer3(x)
+            return self.fc(self.avgpool(x).flatten(1))
+    return _Net()

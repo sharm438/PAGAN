@@ -797,10 +797,13 @@ def main(args):
             else:
                 velocities = []
                 for node_id in range(args.num_spokes):
-                    start_vec = None
-                    if args.aggregation in ('isolated', 'p2p'):
+                    if args.aggregation in ('fedavg', 'fedsgd'):
+                        start_vec = global_wts.detach().clone()
+                    elif args.aggregation in ('isolated', 'p2p'):
                         start_vec = node_states[node_id].detach().clone()
-
+                    else:
+                        start_vec = None
+                    
                     updated_wts = train_node.local_train_worker_inline(
                         node_id, start_vec,
                         distributed_train_data[node_id],
